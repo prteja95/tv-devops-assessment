@@ -1,24 +1,6 @@
 # TV DevOps Assessment - Part 1 & 2
 
 --------------------------------------------------
-### PROJECT STRUCTURE
---------------------------------------------------
-tv-devops-assessment/
-├── app/                  - Part 1 - Node.js Express App
-│   ├── src/              - TypeScript source code
-│   ├── dist/             - Compiled JS (after build)
-│   ├── Dockerfile        - Multi-stage Docker build
-│   └── package.json      - Dependencies
-│
-├── iac/                  - Part 2 - Infrastructure as Code
-│   ├── main.ts           - CDKTF stack definition
-│   ├── cdktf.json        - Terraform config
-│   ├── .env.example      - Environment template
-│   └── tsconfig.json     - TypeScript config
-│
-└── README.md             - Documentation
-
---------------------------------------------------
 ### PART 1 - NODE.JS EXPRESS APP
 --------------------------------------------------
 Features:
