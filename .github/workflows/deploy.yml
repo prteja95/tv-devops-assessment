@@ -5,13 +5,8 @@ on:
     branches: [main]
 
 env:
-  # Non-sensitive configuration from GitHub Variables
+  # Core configuration
   AWS_REGION: ${{ vars.AWS_REGION }}
-  CUSTOM_VPC_CIDR: ${{ vars.CUSTOM_VPC_CIDR }}
-  PUBLIC_SUBNET_CIDR_A: ${{ vars.PUBLIC_SUBNET_CIDR_A }}
-  PUBLIC_SUBNET_CIDR_B: ${{ vars.PUBLIC_SUBNET_CIDR_B }}
-  PRIVATE_SUBNET_CIDR_A: ${{ vars.PRIVATE_SUBNET_CIDR_A }}
-  PRIVATE_SUBNET_CIDR_B: ${{ vars.PRIVATE_SUBNET_CIDR_B }}
   APP_REPO_NAME: ${{ vars.APP_REPO_NAME }}
   APP_CLUSTER_NAME: ${{ vars.APP_CLUSTER_NAME }}
   APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}
@@ -34,7 +29,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials
+      # Step 2: Verify CIDR blocks
+      - name: Validate CIDR blocks
+        run: |
+          echo "Verifying CIDR block formatting:"
+          echo "CUSTOM_VPC_CIDR: '${{ vars.CUSTOM_VPC_CIDR }}'"
+          echo "PUBLIC_SUBNET_CIDR_A: '${{ vars.PUBLIC_SUBNET_CIDR_A }}'"
+          echo "PUBLIC_SUBNET_CIDR_B: '${{ vars.PUBLIC_SUBNET_CIDR_B }}'"
+          echo "PRIVATE_SUBNET_CIDR_A: '${{ vars.PRIVATE_SUBNET_CIDR_A }}'"
+          echo "PRIVATE_SUBNET_CIDR_B: '${{ vars.PRIVATE_SUBNET_CIDR_B }}'"
+          
+          # Verify no hidden characters
+          if [[ "${{ vars.PRIVATE_SUBNET_CIDR_B }}" != "10.50.4.0/24" ]]; then
+            echo "ERROR: CIDR block contains unexpected characters"
+            exit 1
+          fi
+
+      # Step 3: Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -42,7 +53,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Setup Node.js with caching
+      # Step 4: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -50,37 +61,51 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'iac/package-lock.json'
 
-      # Step 4: Install CDKTF
+      # Step 5: Install CDKTF
       - name: Install CDKTF
         run: npm install -g cdktf-cli@latest
 
-      # Step 5: Install Terraform
+      # Step 6: Install Terraform
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 6: Deploy Infrastructure
+      # Step 7: Deploy Infrastructure
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
           npm ci
           cdktf get
+          
+          # Clean CIDR blocks one final time
+          export CLEANED_PUBLIC_A=$(echo "$PUBLIC_SUBNET_CIDR_A" | tr -d '\r\n')
+          export CLEANED_PRIVATE_B=$(echo "$PRIVATE_SUBNET_CIDR_B" | tr -d '\r\n')
+          
+          echo "Using cleaned CIDR blocks:"
+          echo "Public A: $CLEANED_PUBLIC_A"
+          echo "Private B: $CLEANED_PRIVATE_B"
+          
           cdktf deploy --auto-approve
         env:
-          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}  # Only secret needed for CDKTF
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          CUSTOM_VPC_CIDR: ${{ format('{0}', trim(vars.CUSTOM_VPC_CIDR)) }}
+          PUBLIC_SUBNET_CIDR_A: ${{ format('{0}', trim(vars.PUBLIC_SUBNET_CIDR_A)) }}
+          PUBLIC_SUBNET_CIDR_B: ${{ format('{0}', trim(vars.PUBLIC_SUBNET_CIDR_B)) }}
+          PRIVATE_SUBNET_CIDR_A: ${{ format('{0}', trim(vars.PRIVATE_SUBNET_CIDR_A)) }}
+          PRIVATE_SUBNET_CIDR_B: ${{ format('{0}', trim(vars.PRIVATE_SUBNET_CIDR_B)) }}
 
-      # Step 7: Wait for infrastructure stabilization
-      - name: Wait for infrastructure
+      # Step 8: Wait for infrastructure
+      - name: Wait for infrastructure stabilization
         run: sleep 300
 
-      # Step 8: Login to ECR
+      # Step 9: Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 9: Build Docker image
+      # Step 10: Build Docker image
       - name: Build Docker image
         run: |
           IMAGE_TAG=${GITHUB_SHA::7}
@@ -88,12 +113,12 @@ jobs:
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
 
-      # Step 10: Push Docker image
+      # Step 11: Push Docker image
       - name: Push Docker image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.IMAGE_TAG }}
 
-      # Step 11: Force ECS deployment
+      # Step 12: Force ECS deployment
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -102,18 +127,18 @@ jobs:
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
 
-      # Step 12: Wait for service stabilization
+      # Step 13: Wait for service stabilization
       - name: Wait for ECS service
         run: sleep 300
 
-      # Step 13: Get ALB DNS
+      # Step 14: Get ALB DNS
       - name: Get ALB DNS
         id: alb-dns
         run: |
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
           echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
-      # Step 14: Test endpoint
+      # Step 15: Test endpoint
       - name: Test ALB endpoint
         run: |
           curl --retry 5 --retry-delay 10 http://${{ env.ALB_DNS }}/health
