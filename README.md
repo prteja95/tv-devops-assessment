@@ -37,7 +37,11 @@ cp .env.example .env
 Open .env and update the required ### INPUTS ### variables with your AWS account details 
 ####  this ensure that .env isolates different enivronments for dev/staging/Prod #####
 AWS_ACCOUNT_ID=<your AWS account ID>
+
+
 AWS_REGION=us-east-1 (or your preferred region)
+
+
 APP_IMAGE_TAG=v2 (must match the Docker image tag you will push to ECR)
 
 ### You can also customize:
