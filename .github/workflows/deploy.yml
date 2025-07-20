@@ -16,11 +16,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Checkout repo
+      # 1. Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials
+      # 2. Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -28,96 +28,74 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Setup Node.js 20.11 (single version for CDKTF + build)
-      - name: Setup Node.js 20.11.x
+      # 3. Setup Node.js (20.11 for cdktf)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20.11.x
+          node-version: '20.11.1'
 
-      # Step 4: Install Terraform CLI (required by CDKTF)
-      - name: Install Terraform CLI
-        run: |
-          echo "Installing Terraform CLI"
-          sudo apt-get update -y
-          sudo apt-get install -y gnupg software-properties-common curl
-          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-          sudo apt-get update -y
-          sudo apt-get install terraform -y
-          terraform -version || { echo "Terraform install FAILED"; exit 1; }
-
-
-      # Step 5: Deploy AWS Infrastructure
-      - name: Deploy AWS Infrastructure using CDKTF
+      # 4. Deploy AWS Infrastructure using CDKTF
+      - name: Deploy AWS Infrastructure
         run: |
           set -x
           cd iac || { echo "FAILED: iac folder not found"; exit 1; }
           npm ci || { echo "FAILED: npm ci in iac folder"; exit 1; }
-          cdktf get || { echo "FAILED: cdktf get"; exit 1; }
-          cdktf deploy --auto-approve || { echo "FAILED: cdktf deploy"; exit 1; }
+          npx cdktf get || { echo "FAILED: cdktf get"; exit 1; }
+          npx cdktf synth || { echo "FAILED: cdktf synth"; exit 1; }
+          npx cdktf deploy --auto-approve || { echo "FAILED: cdktf deploy"; exit 1; }
 
-      # Step 6: Wait for infra (ALB, ECS, NAT) to stabilize
-      - name: Wait for infra stabilization
+      # 5. Wait for infra (ALB, ECS cluster, NAT) to fully stabilize
+      - name: Wait for infra to stabilize
         run: |
-          echo "Waiting 5 minutes for infra to stabilize"
+          echo "Waiting 5 minutes for ALB + ECS cluster stabilization..."
           sleep 300
 
-      # Step 7: Log in to Amazon ECR
+      # 6. Log in to Amazon ECR
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 8: Build Docker image with short commit SHA tag
+      # 7. Build Docker image with commit SHA as version tag
       - name: Build and tag Docker image
         run: |
           set -x
           IMAGE_TAG=${GITHUB_SHA::7}
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          echo "Building Docker image with tag ${IMAGE_TAG}"
           docker buildx build --platform linux/amd64 \
-            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app \
-            || { echo "FAILED: Docker build"; exit 1; }
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
 
-      # Step 9: Push Docker image to ECR
+      # 8. Push Docker image to ECR
       - name: Push Docker image to ECR
         run: |
           set -x
-          echo "Pushing Docker image to ECR"
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG} \
-            || { echo "FAILED: Docker push"; exit 1; }
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG}
 
-      # Step 10: Force ECS service to redeploy with new image
+      # 9. Force ECS service to redeploy with the new image
       - name: Force new ECS deployment
         run: |
           set -x
-          echo "Forcing ECS service to pick the new image"
           aws ecs update-service \
             --cluster ${{ env.CLUSTER_NAME }} \
             --service ${{ env.SERVICE_NAME }} \
             --force-new-deployment \
-            --region ${{ env.AWS_REGION }} \
-            || { echo "FAILED: ECS update-service"; exit 1; }
+            --region ${{ env.AWS_REGION }}
 
-      # Step 11: Wait for ECS tasks + ALB registration
+      # 10. Wait for ECS tasks + ALB target registration
       - name: Wait for ECS service stabilization
         run: |
-          echo "Waiting 5 minutes for ECS tasks and ALB target registration"
-          sleep 300
+          echo "Waiting couple of  minutes for ECS service stabilization..."
+          sleep 500
 
-      # Step 12: Fetch ALB DNS from Terraform Output
+      # 11. Fetch ALB DNS Name from Terraform Output
       - name: Get ALB DNS
         id: alb_dns
         run: |
-          echo "Fetching ALB DNS from Terraform output"
+          set -x
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          if [ -z "$ALB_DNS" ]; then
-            echo "FAILED: Could not retrieve ALB DNS Name"
-            exit 1
-          fi
           echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
-      # Step 13: Test ALB health endpoint
+      # 12. Test ALB health endpoint
       - name: Test ALB health endpoint
         run: |
-          echo "Testing ALB health endpoint at http://${ALB_DNS}/health"
-          curl --retry 10 --retry-delay 15 http://${ALB_DNS}/health || { echo "FAILED: Health check"; exit 1; }
+          echo "Testing health endpoint at http://${ALB_DNS}/health"
+          curl --retry 10 --retry-delay 15 http://${ALB_DNS}/health || exit 1
