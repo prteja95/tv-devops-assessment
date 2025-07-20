@@ -8,9 +8,8 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   APP_REPO_NAME: ${{ vars.APP_REPO_NAME }}
   APP_CLUSTER_NAME: ${{ vars.APP_CLUSTER_NAME }}
-  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  #  match your task definition (e.g. "v2")
+  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  # Must be "v2" to match your task definition
   CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
-  DESTROY_DELAY_MINUTES: 5  # Auto-cleanup delay
 
 jobs:
   deploy:
@@ -18,17 +17,17 @@ jobs:
     environment: production
 
     steps:
-      # ====== 1. CLEANUP PREVIOUS DEPLOYMENT ======
+      # ====== 1. SETUP & CLEANUP ======
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Destroy previous deployment
-        continue-on-error: true  # Skip if no stack exists
+        continue-on-error: true
         run: |
           cd iac
           npm ci
-          cdktf get
-          cdktf destroy --auto-approve
+          npx cdktf get
+          npx cdktf destroy --auto-approve || echo "No stack to destroy"
 
       # ====== 2. INFRASTRUCTURE DEPLOYMENT ======
       - name: Configure AWS credentials
@@ -38,20 +37,28 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Node.js
+      - name: Setup Node.js and CDKTF
         uses: actions/setup-node@v4
         with:
           node-version: 20.x
+          cache: 'npm'
+          cache-dependency-path: 'iac/package-lock.json'
+        run: |
+          npm install -g cdktf-cli@latest
+          cd iac
+          npm ci
+          npx cdktf get
 
-      - name: Install CDKTF
-        run: npm install -g cdktf-cli@latest
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
 
       - name: Deploy infrastructure
         run: |
           cd iac
-          npm ci
-          cdktf get
-          cdktf deploy --auto-approve
+          npx cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
 
@@ -62,7 +69,6 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          # Use version tag from variables (not commit SHA)
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
@@ -78,23 +84,16 @@ jobs:
 
       # ====== 4. VERIFICATION ======
       - name: Wait for service stabilization
-        run: sleep 120  # Reduced from 300s for faster feedback
+        run: sleep 180
 
       - name: Verify deployment
         run: |
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          curl --retry 10 --retry-delay 15 http://$ALB_DNS/health
+          curl --retry 10 --retry-delay 15 http://$ALB_DNS/health || exit 1
 
       # ====== 5. CLEANUP ======
-      - name: Auto-destroy (success)
-        if: success()
-        run: |
-          sleep $(( ${{ env.DESTROY_DELAY_MINUTES }} * 60 ))
-          cd iac
-          cdktf destroy --auto-approve
-
-      - name: Auto-destroy (failure)
+      - name: Auto-destroy (on failure)
         if: failure()
         run: |
           cd iac
-          cdktf destroy --auto-approve
+          npx cdktf destroy --auto-approve
