@@ -3,7 +3,7 @@ name: CI/CD Deploy to AWS ECS
 on:
   push:
     branches:
-      - main   # Trigger pipeline only on main branch
+      - main
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
@@ -28,23 +28,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Setup Node.js 20.11 (single version for CDKTF + build)
+      # Step 3: Setup Node.js with cache only for iac folder
       - name: Setup Node.js 20.11.x
         uses: actions/setup-node@v4
         with:
           node-version: 20.11.x
           cache: 'npm'
+          cache-dependency-path: 'iac/package-lock.json'  # Point to  lock file
 
-      # Step 4: Install CDKTF globally before Terraform
+      # Step 4: Install CDKTF globally
       - name: Install CDKTF CLI
         run: |
           npm install -g cdktf-cli@latest
           cdktf --version || { echo "CDKTF install FAILED"; exit 1; }
 
-      # Step 5: Install Terraform CLI (required by CDKTF)
+      # Step 5: Install Terraform CLI
       - name: Install Terraform CLI
         run: |
-          echo "Installing Terraform CLI"
           sudo apt-get update -y
           sudo apt-get install -y gnupg software-properties-common curl
           curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
@@ -58,9 +58,14 @@ jobs:
         run: |
           set -x
           cd iac || { echo "FAILED: iac folder not found"; exit 1; }
-          npm ci --ignore-scripts || { echo "FAILED: npm ci in iac folder"; exit 1; }
+          # Generate lock file if it doesn't exist
+          if [ ! -f package-lock.json ]; then
+            npm install --package-lock-only
+          fi
+          npm ci || { echo "FAILED: npm ci in iac folder"; exit 1; }
           cdktf get || { echo "FAILED: cdktf get"; exit 1; }
           cdktf deploy --auto-approve || { echo "FAILED: cdktf deploy"; exit 1; }
+
 
       # Step 7: Wait for infra (ALB, ECS, NAT) to stabilize
       - name: Wait for infra stabilization
