@@ -1,0 +1,74 @@
+name: CI/CD Deploy to AWS ECS
+
+on:
+  push:
+    branches:
+      - main   # Trigger only when pushing to main
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  APP_REPO_NAME: ${{ secrets.APP_REPO_NAME }}
+  CLUSTER_NAME: ${{ secrets.CLUSTER_NAME }}
+  SERVICE_NAME: ${{ secrets.SERVICE_NAME }}
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      #  Checkout repo
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      #  Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      #  Log in to Amazon ECR
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      #  Build Docker image with commit SHA tag
+      - name: Build and tag Docker image
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          docker buildx build --platform linux/amd64 \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
+
+      #  Push Docker image to ECR
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG}
+
+      ### Deploy IaC (cdktf deploy)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install CDKTF dependencies
+        run: |
+          cd iac
+          npm install
+          npx cdktf get
+
+      - name: Deploy infrastructure via CDKTF
+        run: |
+          cd iac
+          npx cdktf deploy --auto-approve
+
+      #  Force ECS service to redeploy new image
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.CLUSTER_NAME }} \
+            --service ${{ env.SERVICE_NAME }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
