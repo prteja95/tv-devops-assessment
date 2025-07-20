@@ -3,7 +3,7 @@ name: CI/CD Deploy to AWS ECS
 on:
   push:
     branches:
-      - main   # Trigger only when pushing to main
+      - main   # Trigger only on push to main
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION }}
@@ -11,18 +11,16 @@ env:
   CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
   SERVICE_NAME: ${{ vars.SERVICE_NAME }}
 
-
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      #  Checkout repo
+      ###  Checkout repo
       - name: Checkout code
         uses: actions/checkout@v4
 
-      #  Configure AWS credentials
+      ###  Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -30,25 +28,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      #  Log in to Amazon ECR
-      - name: Log in to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      #  Build Docker image with commit SHA tag
-      - name: Build and tag Docker image
-        run: |
-          IMAGE_TAG=${GITHUB_SHA::7}
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          docker buildx build --platform linux/amd64 \
-            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
-
-      #  Push Docker image to ECR
-      - name: Push Docker image to ECR
-        run: |
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG}
-
-      ### Deploy IaC (cdktf deploy)
+      ###  Deploy AWS Infrastructure using CDKTF
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -65,7 +45,29 @@ jobs:
           cd iac
           npx cdktf deploy --auto-approve
 
-      #  Force ECS service to redeploy new image
+      # Wait a bit for ALB + ECS infra to fully stabilize
+      - name: Wait for infra to stabilize
+        run: sleep 180
+
+      ###  Log in to Amazon ECR
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      ###  Build Docker image with commit SHA tag
+      - name: Build and tag Docker image
+        run: |
+          IMAGE_TAG=${GITHUB_SHA::7}
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          docker buildx build --platform linux/amd64 \
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
+
+      ###  Push Docker image to ECR
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG}
+
+      ###  Force ECS service to redeploy new image
       - name: Force new ECS deployment
         run: |
           aws ecs update-service \
@@ -73,3 +75,20 @@ jobs:
             --service ${{ env.SERVICE_NAME }} \
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
+
+      # Wait for ECS tasks + ALB registration
+      - name: Wait for ECS service stabilization
+        run: sleep 600
+
+      ###  Fetch ALB DNS Name from Terraform Output
+      - name: Get ALB DNS
+        id: alb_dns
+        run: |
+          ALB_DNS=$(cd iac && terraform output -raw albDnsName)
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+
+      ###  Test ALB /health endpoint
+      - name: Test ALB health endpoint
+        run: |
+          echo "Testing health endpoint at http://${ALB_DNS}/health"
+          curl --retry 10 --retry-delay 10 http://${ALB_DNS}/health || exit 1
