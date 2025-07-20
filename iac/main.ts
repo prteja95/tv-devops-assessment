@@ -148,34 +148,51 @@ class TvDevOpsStack extends TerraformStack {
     //  ECS Cluster
     const ecsCluster = new EcsCluster(this, "ecsCluster", { name: appClusterName });
 
-    //  Security Groups
-    const albSg = new SecurityGroup(this, "albSg", {
-      name: "alb-sg",
-      description: "Allow inbound HTTP traffic to ALB",
-      vpcId: vpc.id,
-      ingress: albAllowedCidrs.map((cidr) => ({
-        fromPort: albPort,
-        toPort: albPort,
-        protocol: "tcp",
-        cidrBlocks: [cidr],
-      })),
-      egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }],
-    });
+// First declare both security groups without the cross-references
+const albSg = new SecurityGroup(this, "albSg", {
+  name: "alb-sg",
+  description: "Allow inbound HTTP traffic to ALB",
+  vpcId: vpc.id,
+  ingress: albAllowedCidrs.map((cidr) => ({
+    fromPort: albPort,
+    toPort: albPort,
+    protocol: "tcp",
+    cidrBlocks: [cidr],
+  })),
+  egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }]
+});
 
-    const ecsSg = new SecurityGroup(this, "ecsSg", {
-      name: "ecs-tasks-sg",
-      description: "Allow only ALB to ECS traffic",
-      vpcId: vpc.id,
-      ingress: [
-        {
-          fromPort: containerPort,
-          toPort: containerPort,
-          protocol: "tcp",
-          securityGroups: [albSg.id],
-        },
-      ],
-      egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }],
-    });
+const ecsSg = new SecurityGroup(this, "ecsSg", {
+  name: "ecs-tasks-sg",
+  description: "Allow only ALB to ECS traffic",
+  vpcId: vpc.id,
+  ingress: [], // Will be updated below
+  egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }]
+});
+
+// Now add the cross-referencing rules
+albSg.addOverride('egress', [
+  {
+    fromPort: containerPort,
+    toPort: containerPort,
+    protocol: "tcp",
+    securityGroups: [ecsSg.id],
+    description: "Allow ALB to forward to ECS tasks"
+  },
+  { 
+    fromPort: 0, 
+    toPort: 0, 
+    protocol: "-1", 
+    cidrBlocks: sgEgressCidrs 
+  }
+]);
+
+ecsSg.addOverride('ingress', [{
+  fromPort: containerPort,
+  toPort: containerPort,
+  protocol: "tcp",
+  securityGroups: [albSg.id]
+}]);
 
     //  ECR Repo
     const ecrRepo = new EcrRepository(this, "appRepo", { name: appRepoName });
