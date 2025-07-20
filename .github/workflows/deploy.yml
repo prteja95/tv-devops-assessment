@@ -2,22 +2,36 @@ name: CI/CD Deploy to AWS ECS
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
 
 env:
+  # Non-sensitive configuration from GitHub Variables
   AWS_REGION: ${{ vars.AWS_REGION }}
+  CUSTOM_VPC_CIDR: ${{ vars.CUSTOM_VPC_CIDR }}
+  PUBLIC_SUBNET_CIDR_A: ${{ vars.PUBLIC_SUBNET_CIDR_A }}
+  PUBLIC_SUBNET_CIDR_B: ${{ vars.PUBLIC_SUBNET_CIDR_B }}
+  PRIVATE_SUBNET_CIDR_A: ${{ vars.PRIVATE_SUBNET_CIDR_A }}
+  PRIVATE_SUBNET_CIDR_B: ${{ vars.PRIVATE_SUBNET_CIDR_B }}
   APP_REPO_NAME: ${{ vars.APP_REPO_NAME }}
-  CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
-  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+  APP_CLUSTER_NAME: ${{ vars.APP_CLUSTER_NAME }}
+  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}
+  CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+  ALB_PORT: ${{ vars.ALB_PORT }}
+  DESIRED_TASKS: ${{ vars.DESIRED_TASKS }}
+  ALB_ALLOWED_CIDRS: ${{ vars.ALB_ALLOWED_CIDRS }}
+  SG_EGRESS_CIDRS: ${{ vars.SG_EGRESS_CIDRS }}
+  ECS_CPU: ${{ vars.ECS_CPU }}
+  ECS_MEMORY: ${{ vars.ECS_MEMORY }}
+  LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    environment: production
 
     steps:
-      # Step 1: Checkout repo
-      - name: Checkout code
+      # Step 1: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       # Step 2: Configure AWS credentials
@@ -28,107 +42,78 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Setup Node.js with cache only for iac folder
-      - name: Setup Node.js 20.11.x
+      # Step 3: Setup Node.js with caching
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20.11.x
+          node-version: 20.x
           cache: 'npm'
-          cache-dependency-path: 'iac/package-lock.json'  # Point to  lock file
+          cache-dependency-path: 'iac/package-lock.json'
 
-      # Step 4: Install CDKTF globally
-      - name: Install CDKTF CLI
+      # Step 4: Install CDKTF
+      - name: Install CDKTF
+        run: npm install -g cdktf-cli@latest
+
+      # Step 5: Install Terraform
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+          terraform_wrapper: false
+
+      # Step 6: Deploy Infrastructure
+      - name: Deploy AWS Infrastructure
         run: |
-          npm install -g cdktf-cli@latest
-          cdktf --version || { echo "CDKTF install FAILED"; exit 1; }
+          cd iac
+          npm ci
+          cdktf get
+          cdktf deploy --auto-approve
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}  # Only secret needed for CDKTF
 
-      # Step 5: Install Terraform CLI
-      - name: Install Terraform CLI
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y gnupg software-properties-common curl
-          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
-          sudo apt-get update -y
-          sudo apt-get install terraform -y
-          terraform -version || { echo "Terraform install FAILED"; exit 1; }
+      # Step 7: Wait for infrastructure stabilization
+      - name: Wait for infrastructure
+        run: sleep 300
 
-      # Step 6: Deploy AWS Infrastructure
-      - name: Deploy AWS Infrastructure using CDKTF
-        run: |
-          set -x
-          cd iac || { echo "FAILED: iac folder not found"; exit 1; }
-          # Generate lock file if it doesn't exist
-          if [ ! -f package-lock.json ]; then
-            npm install --package-lock-only
-          fi
-          npm ci || { echo "FAILED: npm ci in iac folder"; exit 1; }
-          cdktf get || { echo "FAILED: cdktf get"; exit 1; }
-          cdktf deploy --auto-approve || { echo "FAILED: cdktf deploy"; exit 1; }
-
-
-      # Step 7: Wait for infra (ALB, ECS, NAT) to stabilize
-      - name: Wait for infra stabilization
-        run: |
-          echo "Waiting 5 minutes for infra to stabilize"
-          sleep 300
-
-      # Step 8: Log in to Amazon ECR
-      - name: Log in to Amazon ECR
+      # Step 8: Login to ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 9: Build Docker image with short commit SHA tag
-      - name: Build and tag Docker image
+      # Step 9: Build Docker image
+      - name: Build Docker image
         run: |
-          set -x
           IMAGE_TAG=${GITHUB_SHA::7}
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-          echo "Building Docker image with tag ${IMAGE_TAG}"
           docker buildx build --platform linux/amd64 \
-            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app \
-            || { echo "FAILED: Docker build"; exit 1; }
+            -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:$IMAGE_TAG ./app
 
-      # Step 10: Push Docker image to ECR
-      - name: Push Docker image to ECR
+      # Step 10: Push Docker image
+      - name: Push Docker image
         run: |
-          set -x
-          echo "Pushing Docker image to ECR"
-          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${IMAGE_TAG} \
-            || { echo "FAILED: Docker push"; exit 1; }
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.IMAGE_TAG }}
 
-      # Step 11: Force ECS service to redeploy with new image
-      - name: Force new ECS deployment
+      # Step 11: Force ECS deployment
+      - name: Force ECS deployment
         run: |
-          set -x
-          echo "Forcing ECS service to pick the new image"
           aws ecs update-service \
-            --cluster ${{ env.CLUSTER_NAME }} \
-            --service ${{ env.SERVICE_NAME }} \
+            --cluster ${{ env.APP_CLUSTER_NAME }} \
+            --service ${{ env.APP_CLUSTER_NAME }}-service \
             --force-new-deployment \
-            --region ${{ env.AWS_REGION }} \
-            || { echo "FAILED: ECS update-service"; exit 1; }
+            --region ${{ env.AWS_REGION }}
 
-      # Step 12: Wait for ECS tasks + ALB registration
-      - name: Wait for ECS service stabilization
-        run: |
-          echo "Waiting 5 minutes for ECS tasks and ALB target registration"
-          sleep 300
+      # Step 12: Wait for service stabilization
+      - name: Wait for ECS service
+        run: sleep 300
 
-      # Step 13: Fetch ALB DNS from Terraform Output
+      # Step 13: Get ALB DNS
       - name: Get ALB DNS
-        id: alb_dns
+        id: alb-dns
         run: |
-          echo "Fetching ALB DNS from Terraform output"
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          if [ -z "$ALB_DNS" ]; then
-            echo "FAILED: Could not retrieve ALB DNS Name"
-            exit 1
-          fi
           echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
-      # Step 14: Test ALB health endpoint
-      - name: Test ALB health endpoint
+      # Step 14: Test endpoint
+      - name: Test ALB endpoint
         run: |
-          echo "Testing ALB health endpoint at http://${ALB_DNS}/health"
-          curl --retry 10 --retry-delay 15 http://${ALB_DNS}/health || { echo "FAILED: Health check"; exit 1; }
+          curl --retry 5 --retry-delay 10 http://${{ env.ALB_DNS }}/health
