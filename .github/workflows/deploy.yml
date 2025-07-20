@@ -29,21 +29,25 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Verify CIDR blocks
-      - name: Validate CIDR blocks
+      # Step 2: Clean CIDR blocks
+      - name: Clean CIDR blocks
+        id: clean-cidr
         run: |
-          echo "Verifying CIDR block formatting:"
-          echo "CUSTOM_VPC_CIDR: '${{ vars.CUSTOM_VPC_CIDR }}'"
-          echo "PUBLIC_SUBNET_CIDR_A: '${{ vars.PUBLIC_SUBNET_CIDR_A }}'"
-          echo "PUBLIC_SUBNET_CIDR_B: '${{ vars.PUBLIC_SUBNET_CIDR_B }}'"
-          echo "PRIVATE_SUBNET_CIDR_A: '${{ vars.PRIVATE_SUBNET_CIDR_A }}'"
-          echo "PRIVATE_SUBNET_CIDR_B: '${{ vars.PRIVATE_SUBNET_CIDR_B }}'"
+          echo "CUSTOM_VPC_CIDR=${VARS_CUSTOM_VPC_CIDR//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_A=${VARS_PUBLIC_SUBNET_CIDR_A//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_B=${VARS_PUBLIC_SUBNET_CIDR_B//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_A=${VARS_PRIVATE_SUBNET_CIDR_A//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_B=${VARS_PRIVATE_SUBNET_CIDR_B//[$'\t\r\n ']}" >> $GITHUB_ENV
           
-          # Verify no hidden characters
-          if [[ "${{ vars.PRIVATE_SUBNET_CIDR_B }}" != "10.50.4.0/24" ]]; then
-            echo "ERROR: CIDR block contains unexpected characters"
-            exit 1
-          fi
+          echo "Cleaned CIDR blocks:"
+          echo "CUSTOM_VPC_CIDR: $CUSTOM_VPC_CIDR"
+          echo "PRIVATE_SUBNET_CIDR_B: $PRIVATE_SUBNET_CIDR_B"
+        env:
+          VARS_CUSTOM_VPC_CIDR: ${{ vars.CUSTOM_VPC_CIDR }}
+          VARS_PUBLIC_SUBNET_CIDR_A: ${{ vars.PUBLIC_SUBNET_CIDR_A }}
+          VARS_PUBLIC_SUBNET_CIDR_B: ${{ vars.PUBLIC_SUBNET_CIDR_B }}
+          VARS_PRIVATE_SUBNET_CIDR_A: ${{ vars.PRIVATE_SUBNET_CIDR_A }}
+          VARS_PRIVATE_SUBNET_CIDR_B: ${{ vars.PRIVATE_SUBNET_CIDR_B }}
 
       # Step 3: Configure AWS credentials
       - name: Configure AWS credentials
@@ -79,23 +83,19 @@ jobs:
           npm ci
           cdktf get
           
-          # Clean CIDR blocks one final time
-          export CLEANED_PUBLIC_A=$(echo "$PUBLIC_SUBNET_CIDR_A" | tr -d '\r\n')
-          export CLEANED_PRIVATE_B=$(echo "$PRIVATE_SUBNET_CIDR_B" | tr -d '\r\n')
-          
-          echo "Using cleaned CIDR blocks:"
-          echo "Public A: $CLEANED_PUBLIC_A"
-          echo "Private B: $CLEANED_PRIVATE_B"
+          echo "Final CIDR verification:"
+          echo "PRIVATE_SUBNET_CIDR_B: '$PRIVATE_SUBNET_CIDR_B'"
           
           cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          CUSTOM_VPC_CIDR: ${{ format('{0}', trim(vars.CUSTOM_VPC_CIDR)) }}
-          PUBLIC_SUBNET_CIDR_A: ${{ format('{0}', trim(vars.PUBLIC_SUBNET_CIDR_A)) }}
-          PUBLIC_SUBNET_CIDR_B: ${{ format('{0}', trim(vars.PUBLIC_SUBNET_CIDR_B)) }}
-          PRIVATE_SUBNET_CIDR_A: ${{ format('{0}', trim(vars.PRIVATE_SUBNET_CIDR_A)) }}
-          PRIVATE_SUBNET_CIDR_B: ${{ format('{0}', trim(vars.PRIVATE_SUBNET_CIDR_B)) }}
+          CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
+          PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
+          PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
+          PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
+          PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
 
+      # [Rest of the steps remain unchanged...]
       # Step 8: Wait for infrastructure
       - name: Wait for infrastructure stabilization
         run: sleep 300
