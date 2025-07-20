@@ -8,9 +8,15 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   APP_REPO_NAME: ${{ vars.APP_REPO_NAME }}
   APP_CLUSTER_NAME: ${{ vars.APP_CLUSTER_NAME }}
-  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  # Must be "v2"
+  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  # Using your GitHub variable (v2)
   CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
-  DESTROY_DELAY_MINUTES: 5
+  ALB_PORT: ${{ vars.ALB_PORT }}
+  DESIRED_TASKS: ${{ vars.DESIRED_TASKS }}
+  ALB_ALLOWED_CIDRS: ${{ vars.ALB_ALLOWED_CIDRS }}
+  SG_EGRESS_CIDRS: ${{ vars.SG_EGRESS_CIDRS }}
+  ECS_CPU: ${{ vars.ECS_CPU }}
+  ECS_MEMORY: ${{ vars.ECS_MEMORY }}
+  LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
 
 jobs:
   deploy:
@@ -18,11 +24,27 @@ jobs:
     environment: production
 
     steps:
-      # ====== 1. INITIAL SETUP ======
-      - name: Checkout code
+      # Step 1: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ====== 2. INFRASTRUCTURE DEPLOYMENT ======
+      # Step 2: Clean CIDR blocks
+      - name: Clean CIDR blocks
+        id: clean-cidr
+        run: |
+          echo "CUSTOM_VPC_CIDR=${VARS_CUSTOM_VPC_CIDR//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_A=${VARS_PUBLIC_SUBNET_CIDR_A//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_B=${VARS_PUBLIC_SUBNET_CIDR_B//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_A=${VARS_PRIVATE_SUBNET_CIDR_A//[$'\t\r\n ']}" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_B=${VARS_PRIVATE_SUBNET_CIDR_B//[$'\t\r\n ']}" >> $GITHUB_ENV
+        env:
+          VARS_CUSTOM_VPC_CIDR: ${{ vars.CUSTOM_VPC_CIDR }}
+          VARS_PUBLIC_SUBNET_CIDR_A: ${{ vars.PUBLIC_SUBNET_CIDR_A }}
+          VARS_PUBLIC_SUBNET_CIDR_B: ${{ vars.PUBLIC_SUBNET_CIDR_B }}
+          VARS_PRIVATE_SUBNET_CIDR_A: ${{ vars.PRIVATE_SUBNET_CIDR_A }}
+          VARS_PRIVATE_SUBNET_CIDR_B: ${{ vars.PRIVATE_SUBNET_CIDR_B }}
+
+      # Step 3: Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -30,48 +52,62 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Step 4: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20.x
+          cache: 'npm'
+          cache-dependency-path: 'iac/package-lock.json'
 
-      - name: Install CDKTF and dependencies
-        run: |
-          npm install -g cdktf-cli@latest
-          cd iac
-          npm ci
-          npx cdktf get
+      # Step 5: Install CDKTF
+      - name: Install CDKTF
+        run: npm install -g cdktf-cli@latest
 
+      # Step 6: Install Terraform
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: latest
+          terraform_wrapper: false
 
-      - name: Destroy previous deployment
-        continue-on-error: true
+      # Step 7: Deploy Infrastructure
+      - name: Deploy AWS Infrastructure
         run: |
           cd iac
-          npx cdktf destroy --auto-approve || echo "No stack to destroy"
-
-      - name: Deploy infrastructure
-        run: |
-          cd iac
-          npx cdktf deploy --auto-approve
+          npm ci
+          cdktf get
+          cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
+          PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
+          PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
+          PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
+          PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
 
-      # ====== 3. APPLICATION DEPLOYMENT ======
-      - name: Login to ECR
+      # Step 8: Wait for infrastructure
+      - name: Wait for infrastructure stabilization
+        run: sleep 300
+
+      # Step 9: Login to ECR
+      - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push Docker image
+      # Step 10: Build Docker image (using variable)
+      - name: Build Docker image
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
+
+      # Step 11: Push Docker image (using variable)
+      - name: Push Docker image
+        run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
+      # Step 12: Force ECS deployment
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -80,26 +116,18 @@ jobs:
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
 
-      # ====== 4. VERIFICATION ======
-      - name: Wait for service stabilization
-        run: sleep 180
+      # Step 13: Wait for service stabilization
+      - name: Wait for ECS service
+        run: sleep 300
 
-      - name: Verify deployment
+      # Step 14: Get ALB DNS
+      - name: Get ALB DNS
+        id: alb-dns
         run: |
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          curl --retry 10 --retry-delay 15 http://$ALB_DNS/health || exit 1
+          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
-      # ====== 5. CLEANUP ======
-      - name: Schedule auto-destruction
-        if: success()
+      # Step 15: Test endpoint
+      - name: Test ALB endpoint
         run: |
-          echo "Waiting ${{ env.DESTROY_DELAY_MINUTES }} minutes before destruction..."
-          sleep $(( ${{ env.DESTROY_DELAY_MINUTES }} * 60 ))
-          cd iac
-          npx cdktf destroy --auto-approve
-
-      - name: Immediate destruction on failure
-        if: failure()
-        run: |
-          cd iac
-          npx cdktf destroy --auto-approve
+          curl --retry 5 --retry-delay 10 http://${{ env.ALB_DNS }}/health
