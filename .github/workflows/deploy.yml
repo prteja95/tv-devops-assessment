@@ -17,14 +17,11 @@ env:
   ECS_CPU: ${{ vars.ECS_CPU }}
   ECS_MEMORY: ${{ vars.ECS_MEMORY }}
   LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
-  TF_RESOURCE_RETRIES: 3
-  RESOURCE_CHECK_TIMEOUT: 300
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     environment: production
-    timeout-minutes: 30
 
     steps:
       # Step 1: Checkout code
@@ -74,162 +71,13 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7: Comprehensive Resource Check
-      - name: Check for existing AWS resources
-        id: resource-check
-        timeout-minutes: 5
-        run: |
-          echo "Checking for existing AWS resources..."
-          
-          # Function to check resource existence
-          check_resource() {
-            local resource_type=$1
-            local resource_name=$2
-            local query=$3
-            
-            case $resource_type in
-              "elbv2-target-group")
-                aws elbv2 describe-target-groups --names $resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              "ecr-repository")
-                aws ecr describe-repositories --repository-names $resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              "logs-log-group")
-                aws logs describe-log-groups --log-group-name-prefix $resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              "ecs-cluster")
-                aws ecs describe-clusters --clusters $resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              "security-group")
-                aws ec2 describe-security-groups --filters Name=group-name,Values=$resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              "load-balancer")
-                aws elbv2 describe-load-balancers --names $resource_name --query "$query" --output text --region $AWS_REGION 2>/dev/null || echo "None"
-                ;;
-              *)
-                echo "None"
-                ;;
-            esac
-          }
-
-          # Check all critical resources that might conflict
-          TG_ARN=$(check_resource "elbv2-target-group" "ecs-tg" "TargetGroups[0].TargetGroupArn")
-          ECR_REPO_URI=$(check_resource "ecr-repository" "$APP_REPO_NAME" "repositories[0].repositoryUri")
-          LOG_GROUP=$(check_resource "logs-log-group" "/ecs/$APP_CLUSTER_NAME" "logGroups[?logGroupName=='/ecs/$APP_CLUSTER_NAME'].logGroupName" | head -1)
-          ECS_CLUSTER=$(check_resource "ecs-cluster" "$APP_CLUSTER_NAME" "clusters[?clusterName=='$APP_CLUSTER_NAME'].clusterArn" | head -1)
-          ALB_ARN=$(check_resource "load-balancer" "tv-devops-alb" "LoadBalancers[0].LoadBalancerArn")
-          ALB_SG=$(check_resource "security-group" "alb-sg" "SecurityGroups[0].GroupId")
-          ECS_SG=$(check_resource "security-group" "ecs-tasks-sg" "SecurityGroups[0].GroupId")
-
-          # Output results
-          echo "tg_arn=$TG_ARN" >> $GITHUB_OUTPUT
-          echo "ecr_repo_uri=$ECR_REPO_URI" >> $GITHUB_OUTPUT
-          echo "log_group=$LOG_GROUP" >> $GITHUB_OUTPUT
-          echo "ecs_cluster=$ECS_CLUSTER" >> $GITHUB_OUTPUT
-          echo "alb_arn=$ALB_ARN" >> $GITHUB_OUTPUT
-          echo "alb_sg=$ALB_SG" >> $GITHUB_OUTPUT
-          echo "ecs_sg=$ECS_SG" >> $GITHUB_OUTPUT
-
-          # Create import commands file
-          mkdir -p .cdktf
-          echo "#!/bin/sh" > .cdktf/import_commands.sh
-          chmod +x .cdktf/import_commands.sh
-
-          if [ "$TG_ARN" != "None" ]; then
-            echo "cdktf import aws_lb_target_group.tg $TG_ARN" >> .cdktf/import_commands.sh
-          fi
-          if [ "$ECR_REPO_URI" != "None" ]; then
-            echo "cdktf import aws_ecr_repository.app_repo $APP_REPO_NAME" >> .cdktf/import_commands.sh
-          fi
-          if [ "$LOG_GROUP" != "None" ]; then
-            echo "cdktf import aws_cloudwatch_log_group.ecs_logs '$LOG_GROUP'" >> .cdktf/import_commands.sh
-          fi
-          if [ "$ECS_CLUSTER" != "None" ]; then
-            echo "cdktf import aws_ecs_cluster.cluster '$APP_CLUSTER_NAME'" >> .cdktf/import_commands.sh
-          fi
-          if [ "$ALB_ARN" != "None" ]; then
-            echo "cdktf import aws_lb.alb $ALB_ARN" >> .cdktf/import_commands.sh
-          fi
-          if [ "$ALB_SG" != "None" ]; then
-            echo "cdktf import aws_security_group.albSg $ALB_SG" >> .cdktf/import_commands.sh
-          fi
-          if [ "$ECS_SG" != "None" ]; then
-            echo "cdktf import aws_security_group.ecsSg $ECS_SG" >> .cdktf/import_commands.sh
-          fi
-
-          echo "Resource check completed"
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
-          APP_REPO_NAME: ${{ env.APP_REPO_NAME }}
-          APP_CLUSTER_NAME: ${{ env.APP_CLUSTER_NAME }}
-
-      # Step 8: Deploy Infrastructure with comprehensive error handling
+      # Step 7: Deploy Infrastructure
       - name: Deploy AWS Infrastructure
-        id: deploy-infra
         run: |
           cd iac
           npm ci
           cdktf get
-          
-          # Run import commands if any existing resources found
-          if [ -f .cdktf/import_commands.sh ] && [ -s .cdktf/import_commands.sh ]; then
-            echo "Found existing resources, importing..."
-            ./.cdktf/import_commands.sh
-          fi
-          
-          # Deployment with retry logic
-          for i in $(seq 1 $TF_RESOURCE_RETRIES); do
-            echo "Attempt $i of $TF_RESOURCE_RETRIES"
-            
-            # Run deployment and capture output
-            if cdktf deploy --auto-approve 2>&1 | tee cdktf.log; then
-              echo "Deployment succeeded"
-              exit 0
-            fi
-            
-            # Check for specific error patterns
-            if grep -q "already exists" cdktf.log; then
-              echo "Resource conflict detected, attempting to import..."
-              
-              # Extract resource type and name from error
-              RESOURCE_TYPE=$(grep -oE 'aws_[a-z_]+' cdktf.log | head -1)
-              RESOURCE_ID=$(grep -oE 'already exists: [^"]+' cdktf.log | awk '{print $3}' | tr -d '"' | head -1)
-              
-              if [ -n "$RESOURCE_TYPE" ] && [ -n "$RESOURCE_ID" ]; then
-                echo "Attempting to import $RESOURCE_TYPE with ID $RESOURCE_ID"
-                
-                # Determine the Terraform resource name based on type
-                case $RESOURCE_TYPE in
-                  "aws_lb_target_group") TF_NAME="tg" ;;
-                  "aws_ecr_repository") TF_NAME="appRepo" ;;
-                  "aws_cloudwatch_log_group") TF_NAME="ecsLogGroup" ;;
-                  "aws_ecs_cluster") TF_NAME="ecsCluster" ;;
-                  "aws_lb") TF_NAME="alb" ;;
-                  "aws_security_group")
-                    if [[ "$RESOURCE_ID" == *"alb-sg"* ]]; then
-                      TF_NAME="albSg"
-                    else
-                      TF_NAME="ecsSg"
-                    fi
-                    ;;
-                  *) TF_NAME="" ;;
-                esac
-                
-                if [ -n "$TF_NAME" ]; then
-                  echo "cdktf import $RESOURCE_TYPE.$TF_NAME $RESOURCE_ID" >> .cdktf/import_commands.sh
-                  ./.cdktf/import_commands.sh
-                fi
-              fi
-            fi
-            
-            if [ $i -lt $TF_RESOURCE_RETRIES ]; then
-              echo "Waiting before retry..."
-              sleep 15
-            fi
-          done
-          
-          echo "All deployment attempts failed"
-          exit 1
+          cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
@@ -237,22 +85,27 @@ jobs:
           PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
           PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
-          TF_RESOURCE_RETRIES: ${{ env.TF_RESOURCE_RETRIES }}
+
+      # Step 8: Verify Network Connectivity
+      - name: Verify ECR Access
+        run: |
+          # Verify NAT Gateway is operational
+          aws ec2 describe-nat-gateways --filter Name=subnet-id,Values=$(cd iac && terraform output -json public_subnets | jq -r '.[0]') --query "NatGateways[0].State" --region $AWS_REGION
+          
+          # Test connectivity to ECR endpoint
+          aws ecr describe-repositories --repository-names $APP_REPO_NAME --region $AWS_REGION
 
       # Step 9: Wait for infrastructure
       - name: Wait for infrastructure stabilization
-        if: steps.deploy-infra.outcome == 'success'
-        run: sleep 120
+        run: sleep 180  # Increased wait time for NAT to be fully operational
 
       # Step 10: Login to ECR
       - name: Login to Amazon ECR
-        if: steps.deploy-infra.outcome == 'success'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       # Step 11: Build Docker image
       - name: Build Docker image
-        if: steps.deploy-infra.outcome == 'success'
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
@@ -260,35 +113,32 @@ jobs:
 
       # Step 12: Push Docker image
       - name: Push Docker image
-        if: steps.deploy-infra.outcome == 'success'
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
-      # Step 13: Force ECS deployment
+      # Step 13: Force ECS deployment with extended timeout
       - name: Force ECS deployment
-        if: steps.deploy-infra.outcome == 'success'
         run: |
           aws ecs update-service \
             --cluster ${{ env.APP_CLUSTER_NAME }} \
             --service ${{ env.APP_CLUSTER_NAME }}-service \
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
+          # Wait for service to stabilize
+          aws ecs wait services-stable \
+            --cluster ${{ env.APP_CLUSTER_NAME }} \
+            --services ${{ env.APP_CLUSTER_NAME }}-service \
+            --region ${{ env.AWS_REGION }}
 
-      # Step 14: Wait for service stabilization
-      - name: Wait for ECS service
-        if: steps.deploy-infra.outcome == 'success'
-        run: sleep 120
-
-      # Step 15: Get ALB DNS
+      # Step 14: Get ALB DNS
       - name: Get ALB DNS
-        if: steps.deploy-infra.outcome == 'success'
         id: alb-dns
         run: |
+          sleep 30  # Additional wait time for ALB to be fully ready
           ALB_DNS=$(cd iac && terraform output -raw albDnsName)
           echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
 
-      # Step 16: Test endpoint
+      # Step 15: Test endpoint
       - name: Test ALB endpoint
-        if: steps.deploy-infra.outcome == 'success'
         run: |
-          curl --retry 5 --retry-delay 10 http://${{ env.ALB_DNS }}/health
+          curl --retry 10 --retry-delay 15 --retry-connrefused http://${{ env.ALB_DNS }}/health
