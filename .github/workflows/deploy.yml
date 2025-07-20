@@ -8,8 +8,9 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION }}
   APP_REPO_NAME: ${{ vars.APP_REPO_NAME }}
   APP_CLUSTER_NAME: ${{ vars.APP_CLUSTER_NAME }}
-  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  # Must be "v2" to match your task definition
+  APP_IMAGE_TAG: ${{ vars.APP_IMAGE_TAG }}  # Must be "v2"
   CONTAINER_PORT: ${{ vars.CONTAINER_PORT }}
+  DESTROY_DELAY_MINUTES: 5
 
 jobs:
   deploy:
@@ -17,17 +18,9 @@ jobs:
     environment: production
 
     steps:
-      # ====== 1. SETUP & CLEANUP ======
+      # ====== 1. INITIAL SETUP ======
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Destroy previous deployment
-        continue-on-error: true
-        run: |
-          cd iac
-          npm ci
-          npx cdktf get
-          npx cdktf destroy --auto-approve || echo "No stack to destroy"
 
       # ====== 2. INFRASTRUCTURE DEPLOYMENT ======
       - name: Configure AWS credentials
@@ -37,12 +30,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Setup Node.js and CDKTF
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20.x
-          cache: 'npm'
-          cache-dependency-path: 'iac/package-lock.json'
+
+      - name: Install CDKTF and dependencies
         run: |
           npm install -g cdktf-cli@latest
           cd iac
@@ -53,7 +46,12 @@ jobs:
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: latest
-          terraform_wrapper: false
+
+      - name: Destroy previous deployment
+        continue-on-error: true
+        run: |
+          cd iac
+          npx cdktf destroy --auto-approve || echo "No stack to destroy"
 
       - name: Deploy infrastructure
         run: |
@@ -92,7 +90,15 @@ jobs:
           curl --retry 10 --retry-delay 15 http://$ALB_DNS/health || exit 1
 
       # ====== 5. CLEANUP ======
-      - name: Auto-destroy (on failure)
+      - name: Schedule auto-destruction
+        if: success()
+        run: |
+          echo "Waiting ${{ env.DESTROY_DELAY_MINUTES }} minutes before destruction..."
+          sleep $(( ${{ env.DESTROY_DELAY_MINUTES }} * 60 ))
+          cd iac
+          npx cdktf destroy --auto-approve
+
+      - name: Immediate destruction on failure
         if: failure()
         run: |
           cd iac
