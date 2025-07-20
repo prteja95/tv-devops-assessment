@@ -34,12 +34,18 @@ jobs:
         with:
           node-version: 20.11.x
 
-      # Step 4: Install global CDKTF CLI
-      - name: Install global CDKTF CLI
+      # Step 4: Install Terraform CLI (required by CDKTF)
+      - name: Install Terraform CLI
         run: |
-          echo "Installing CDKTF CLI globally"
-          npm install --global cdktf-cli@latest || { echo "FAILED: CDKTF CLI install"; exit 1; }
-          cdktf --version || echo "Warning: Could not verify cdktf version"
+          echo "Installing Terraform CLI"
+          sudo apt-get update -y
+          sudo apt-get install -y gnupg software-properties-common curl
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -y
+          sudo apt-get install terraform -y
+          terraform -version || { echo "Terraform install FAILED"; exit 1; }
+
 
       # Step 5: Deploy AWS Infrastructure
       - name: Deploy AWS Infrastructure using CDKTF
