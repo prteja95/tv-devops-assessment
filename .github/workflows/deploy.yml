@@ -71,43 +71,63 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7A: Destroy existing infra - with ECR cleanup first
-      - name: Destroy existing AWS Infrastructure
+      # Step 7: Comprehensive cleanup and destroy
+      - name: Cleanup and Destroy Existing Infrastructure
         continue-on-error: true
         run: |
-          # First, delete all images from ECR repository
+          # Clean up ECR resources
           echo "Cleaning up ECR repository..."
           REPO_ARN=$(aws ecr describe-repositories --repository-names ${{ env.APP_REPO_NAME }} --query 'repositories[0].repositoryArn' --output text 2>/dev/null || echo "")
           if [ -n "$REPO_ARN" ]; then
-            echo "Found ECR repository, deleting images..."
+            echo "Deleting ECR images..."
             aws ecr batch-delete-image \
               --repository-name ${{ env.APP_REPO_NAME }} \
               --image-ids "$(aws ecr list-images --repository-name ${{ env.APP_REPO_NAME }} --query 'imageIds[*]' --output json)" \
-              || echo "No images to delete or already deleted"
-          else
-            echo "ECR repository not found, skipping image cleanup"
+              || echo "No images to delete"
+            echo "Force deleting ECR repository..."
+            aws ecr delete-repository --repository-name ${{ env.APP_REPO_NAME }} --force || echo "ECR repo deletion failed"
           fi
 
-          # Then destroy infrastructure
-          echo "Destroying infrastructure..."
+          # Clean up CloudWatch Logs
+          echo "Deleting CloudWatch Log Group..."
+          aws logs delete-log-group --log-group-name /ecs/${{ env.APP_CLUSTER_NAME }} || echo "Log group not found"
+
+          # Clean up ALB resources
+          echo "Cleaning up ALB resources..."
+          ALB_ARN=$(aws elbv2 describe-load-balancers --names tv-devops-alb --query 'LoadBalancers[0].LoadBalancerArn' --output text 2>/dev/null || echo "")
+          if [ -n "$ALB_ARN" ]; then
+            echo "Deleting ALB..."
+            aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN || echo "ALB deletion failed"
+            aws elbv2 wait load-balancers-deleted --load-balancer-arns $ALB_ARN || echo "ALB wait failed"
+          fi
+
+          # Clean up Target Group
+          TG_ARN=$(aws elbv2 describe-target-groups --names ecs-tg --query 'TargetGroups[0].TargetGroupArn' --output text 2>/dev/null || echo "")
+          if [ -n "$TG_ARN" ]; then
+            echo "Deleting Target Group..."
+            aws elbv2 delete-target-group --target-group-arn $TG_ARN || echo "Target Group deletion failed"
+          fi
+
+          # Destroy infrastructure with CDKTF
+          echo "Destroying infrastructure with CDKTF..."
           cd iac
           npm ci
           cdktf get
-          cdktf destroy --auto-approve || echo "No existing infra to destroy"
+          cdktf destroy --auto-approve || echo "Destroy command completed (may have failed)"
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
           CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
           PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
           PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
           PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
-          AWS_REGION: ${{ env.AWS_REGION }}
 
-      # Step 7B: Wait for AWS cleanup
-      - name: Wait for AWS cleanup
-        run: sleep 300
+      # Step 8: Wait for cleanup completion
+      - name: Wait for resource cleanup
+        run: sleep 120
 
-      # Step 8: Deploy AWS Infrastructure fresh
+      # Step 9: Deploy AWS Infrastructure
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
@@ -122,34 +142,34 @@ jobs:
           PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
 
-      # Step 9: Verify Network Connectivity
+      # Step 10: Verify Network Connectivity
       - name: Verify ECR Access
         run: |
           aws ec2 describe-nat-gateways --region $AWS_REGION
           aws ecr describe-repositories --repository-names $APP_REPO_NAME --region $AWS_REGION
 
-      # Step 10: Wait for infrastructure stabilization
+      # Step 11: Wait for infrastructure stabilization
       - name: Wait for infrastructure stabilization
         run: sleep 60
 
-      # Step 11: Login to ECR
+      # Step 12: Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 12: Build Docker image from app/Dockerfile
+      # Step 13: Build Docker image
       - name: Build Docker image
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
 
-      # Step 13: Push Docker image
+      # Step 14: Push Docker image
       - name: Push Docker image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
-      # Step 14: Force ECS deployment with extended timeout
+      # Step 15: Force ECS deployment
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -161,38 +181,30 @@ jobs:
             --cluster ${{ env.APP_CLUSTER_NAME }} \
             --services ${{ env.APP_CLUSTER_NAME }}-service \
             --region ${{ env.AWS_REGION }}
-          echo "Waiting 120 seconds to ensure service stabilization..."
           sleep 120
 
-      # Step 15: Get ALB DNS more reliably
+      # Step 16: Get ALB DNS
       - name: Get ALB DNS
         id: alb-dns
         run: |
-          echo "Trying terraform output..."
           cd iac
-          if terraform output -raw albDnsName > /tmp/alb_dns 2>/dev/null; then
-            echo "Terraform output worked."
-          else
-            echo "Terraform output failed, falling back to AWS CLI..."
-            aws elbv2 describe-load-balancers \
-              --names tv-devops-alb \
-              --query 'LoadBalancers[0].DNSName' \
-              --output text > /tmp/alb_dns
-          fi
-          cat /tmp/alb_dns
+          terraform output -raw albDnsName > /tmp/alb_dns 2>/dev/null || \
+          aws elbv2 describe-load-balancers \
+            --names tv-devops-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text > /tmp/alb_dns
           echo "ALB_DNS=$(cat /tmp/alb_dns)" >> $GITHUB_ENV
 
-      # Step 16: Test endpoint with retries
+      # Step 17: Test endpoint
       - name: Test ALB endpoint
         run: |
-          echo "Testing health endpoint: http://${ALB_DNS}/health"
           for i in {1..10}; do
             if curl -sSf http://${ALB_DNS}/health; then
               echo "Health check passed"
               exit 0
             fi
-            echo "Waiting 15s before retry... ($i/10)"
+            echo "Attempt $i/10 - Waiting 30s before retry..."
             sleep 30
           done
-          echo "ALB health endpoint failed after 10 attempts"
+          echo "ALB health check failed after 10 attempts"
           exit 1
