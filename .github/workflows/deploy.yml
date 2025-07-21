@@ -71,14 +71,37 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7A: Destroy existing infra before redeploy (optional clean slate)
+      # Step 7A: Destroy existing infra - with ECR cleanup first
       - name: Destroy existing AWS Infrastructure
         continue-on-error: true
         run: |
+          # First, delete all images from ECR repository
+          echo "Cleaning up ECR repository..."
+          REPO_ARN=$(aws ecr describe-repositories --repository-names ${{ env.APP_REPO_NAME }} --query 'repositories[0].repositoryArn' --output text 2>/dev/null || echo "")
+          if [ -n "$REPO_ARN" ]; then
+            echo "Found ECR repository, deleting images..."
+            aws ecr batch-delete-image \
+              --repository-name ${{ env.APP_REPO_NAME }} \
+              --image-ids "$(aws ecr list-images --repository-name ${{ env.APP_REPO_NAME }} --query 'imageIds[*]' --output json)" \
+              || echo "No images to delete or already deleted"
+          else
+            echo "ECR repository not found, skipping image cleanup"
+          fi
+
+          # Then destroy infrastructure
+          echo "Destroying infrastructure..."
           cd iac
           npm ci
           cdktf get
           cdktf destroy --auto-approve || echo "No existing infra to destroy"
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
+          PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
+          PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
+          PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
+          PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
+          AWS_REGION: ${{ env.AWS_REGION }}
 
       # Step 7B: Wait for AWS cleanup
       - name: Wait for AWS cleanup
