@@ -17,6 +17,7 @@ import { Route } from "./.gen/providers/aws/route";
 import { Eip } from "./.gen/providers/aws/eip";
 import { NatGateway } from "./.gen/providers/aws/nat-gateway";
 import { SecurityGroup } from "./.gen/providers/aws/security-group";
+import { SecurityGroupRule } from "./.gen/providers/aws/security-group-rule";
 import { Lb } from "./.gen/providers/aws/lb";
 import { LbTargetGroup } from "./.gen/providers/aws/lb-target-group";
 import { LbListener } from "./.gen/providers/aws/lb-listener";
@@ -26,9 +27,9 @@ import { IamRole } from "./.gen/providers/aws/iam-role";
 import { IamRolePolicyAttachment } from "./.gen/providers/aws/iam-role-policy-attachment";
 import { EcsTaskDefinition } from "./.gen/providers/aws/ecs-task-definition";
 import { EcsService } from "./.gen/providers/aws/ecs-service";
-import { CloudwatchLogGroup } from "./.gen/providers/aws/cloudwatch-log-group"; 
+import { CloudwatchLogGroup } from "./.gen/providers/aws/cloudwatch-log-group";
 
-//  Validate env vars
+// Validate env vars
 function validateEnv(vars: string[]) {
   const missing = vars.filter((v) => !process.env[v]);
   if (missing.length > 0) throw new Error(`Missing env vars: ${missing.join(", ")}`);
@@ -51,7 +52,7 @@ class TvDevOpsStack extends TerraformStack {
   constructor(scope: Construct, id: string) {
     super(scope, id);
 
-    //  Load env
+    // Load env
     const region = process.env.AWS_REGION!;
     const awsAccountId = process.env.AWS_ACCOUNT_ID!;
     const vpcCidr = process.env.CUSTOM_VPC_CIDR!;
@@ -79,17 +80,17 @@ class TvDevOpsStack extends TerraformStack {
 
     new AwsProvider(this, "aws", { region });
 
-    //  VPC
+    // VPC
     const vpc = new Vpc(this, "customVpc", {
       cidrBlock: vpcCidr,
       enableDnsHostnames: true,
       enableDnsSupport: true,
     });
 
-    //  Internet Gateway
+    // Internet Gateway
     const igw = new InternetGateway(this, "igw", { vpcId: vpc.id });
 
-    //  Multi-AZ Public Subnets
+    // Public Subnets
     const publicSubnetA = new Subnet(this, "publicSubnetA", {
       vpcId: vpc.id,
       cidrBlock: pubCidrA,
@@ -103,7 +104,7 @@ class TvDevOpsStack extends TerraformStack {
       mapPublicIpOnLaunch: true,
     });
 
-    //  Public RT → IGW
+    // Public Route Table
     const publicRT = new RouteTable(this, "publicRT", { vpcId: vpc.id });
     new Route(this, "publicInternetRoute", {
       routeTableId: publicRT.id,
@@ -113,14 +114,14 @@ class TvDevOpsStack extends TerraformStack {
     new RouteTableAssociation(this, "pubAssocA", { subnetId: publicSubnetA.id, routeTableId: publicRT.id });
     new RouteTableAssociation(this, "pubAssocB", { subnetId: publicSubnetB.id, routeTableId: publicRT.id });
 
-    //  NAT Gateway in PublicSubnetA
+    // NAT Gateway
     const natEip = new Eip(this, "natEip", { domain: "vpc" });
     const natGw = new NatGateway(this, "natGw", {
       allocationId: natEip.allocationId,
       subnetId: publicSubnetA.id,
     });
 
-    //  Multi-AZ Private Subnets
+    // Private Subnets
     const privateSubnetA = new Subnet(this, "privateSubnetA", {
       vpcId: vpc.id,
       cidrBlock: privCidrA,
@@ -132,7 +133,7 @@ class TvDevOpsStack extends TerraformStack {
       availabilityZone: azB,
     });
 
-    //  Private RT → NAT
+    // Private RT → NAT
     const privateRT = new RouteTable(this, "privateRT", { vpcId: vpc.id });
     new Route(this, "privateNatRoute", {
       routeTableId: privateRT.id,
@@ -145,59 +146,59 @@ class TvDevOpsStack extends TerraformStack {
     const publicSubnets = [publicSubnetA.id, publicSubnetB.id];
     const privateSubnets = [privateSubnetA.id, privateSubnetB.id];
 
-    //  ECS Cluster
+    // ECS Cluster
     const ecsCluster = new EcsCluster(this, "ecsCluster", { name: appClusterName });
 
-// First declare both security groups without the cross-references
-const albSg = new SecurityGroup(this, "albSg", {
-  name: "alb-sg",
-  description: "Allow inbound HTTP traffic to ALB",
-  vpcId: vpc.id,
-  ingress: albAllowedCidrs.map((cidr) => ({
-    fromPort: albPort,
-    toPort: albPort,
-    protocol: "tcp",
-    cidrBlocks: [cidr],
-  })),
-  egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }]
-});
+    // ✅ Create ALB SG without cross refs
+    const albSg = new SecurityGroup(this, "albSg", {
+      name: "alb-sg",
+      description: "Allow inbound HTTP traffic to ALB",
+      vpcId: vpc.id,
+      ingress: albAllowedCidrs.map((cidr) => ({
+        fromPort: albPort,
+        toPort: albPort,
+        protocol: "tcp",
+        cidrBlocks: [cidr],
+      })),
+      egress: [
+        { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
+      ]
+    });
 
-const ecsSg = new SecurityGroup(this, "ecsSg", {
-  name: "ecs-tasks-sg",
-  description: "Allow only ALB to ECS traffic",
-  vpcId: vpc.id,
-  ingress: [], // Will be updated below
-  egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }]
-});
+    // ✅ Create ECS SG without cross refs
+    const ecsSg = new SecurityGroup(this, "ecsSg", {
+      name: "ecs-tasks-sg",
+      description: "Allow only ALB to ECS traffic",
+      vpcId: vpc.id,
+      ingress: [], // Will add explicit SG rule below
+      egress: [
+        { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
+      ]
+    });
 
-// Now add the cross-referencing rules
-albSg.addOverride('egress', [
-  {
-    fromPort: containerPort,
-    toPort: containerPort,
-    protocol: "tcp",
-    securityGroups: [ecsSg.id],
-    description: "Allow ALB to forward to ECS tasks"
-  },
-  { 
-    fromPort: 0, 
-    toPort: 0, 
-    protocol: "-1", 
-    cidrBlocks: sgEgressCidrs 
-  }
-]);
+    // ✅ Add SG-to-SG rules explicitly (breaks dependency cycle)
+    new SecurityGroupRule(this, "albToEcsRule", {
+      type: "egress",
+      fromPort: containerPort,
+      toPort: containerPort,
+      protocol: "tcp",
+      securityGroupId: albSg.id,
+      sourceSecurityGroupId: ecsSg.id
+    });
 
-ecsSg.addOverride('ingress', [{
-  fromPort: containerPort,
-  toPort: containerPort,
-  protocol: "tcp",
-  securityGroups: [albSg.id]
-}]);
+    new SecurityGroupRule(this, "ecsFromAlbRule", {
+      type: "ingress",
+      fromPort: containerPort,
+      toPort: containerPort,
+      protocol: "tcp",
+      securityGroupId: ecsSg.id,
+      sourceSecurityGroupId: albSg.id
+    });
 
-    //  ECR Repo
+    // ECR Repo
     const ecrRepo = new EcrRepository(this, "appRepo", { name: appRepoName });
 
-    //  ALB across AZs
+    // ALB
     const alb = new Lb(this, "alb", {
       name: "tv-devops-alb",
       loadBalancerType: "application",
@@ -227,7 +228,7 @@ ecsSg.addOverride('ingress', [{
       defaultAction: [{ type: "forward", targetGroupArn: targetGroup.arn }],
     });
 
-    //  IAM Role for ECS Tasks
+    // IAM Role for ECS Tasks
     const ecsTaskRole = new IamRole(this, "ecsTaskRole", {
       name: `ecsTaskRole-${Date.now()}`,
       assumeRolePolicy: JSON.stringify({
@@ -239,18 +240,19 @@ ecsSg.addOverride('ingress', [{
         }],
       }),
     });
+
     new IamRolePolicyAttachment(this, "ecsTaskPolicyAttach", {
       role: ecsTaskRole.name,
       policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
     });
 
-    //  CloudWatch Log Group (USED in ECS)
+    // CloudWatch Log Group
     const logGroup = new CloudwatchLogGroup(this, "ecsLogGroup", {
       name: `/ecs/${appClusterName}`,
       retentionInDays: logRetention,
     });
 
-    //  ECS Task Definition with Logs
+    // ECS Task Definition
     const ecsTaskDef = new EcsTaskDefinition(this, "ecsTaskDef", {
       family: `${appClusterName}-task`,
       requiresCompatibilities: ["FARGATE"],
@@ -269,7 +271,7 @@ ecsSg.addOverride('ingress', [{
           logConfiguration: {
             logDriver: "awslogs",
             options: {
-              "awslogs-group": logGroup.name,    
+              "awslogs-group": logGroup.name,
               "awslogs-region": region,
               "awslogs-stream-prefix": "ecs",
             }
@@ -278,7 +280,7 @@ ecsSg.addOverride('ingress', [{
       ]),
     });
 
-    //  ECS Service (Private subnets)
+    // ECS Service
     new EcsService(this, "ecsService", {
       name: `${appClusterName}-service`,
       cluster: ecsCluster.id,
@@ -300,7 +302,7 @@ ecsSg.addOverride('ingress', [{
       dependsOn: [alb, targetGroup, ecsTaskDef],
     });
 
-    //  Outputs
+    // Outputs
     new TerraformOutput(this, "albDnsName", { value: alb.dnsName });
     new TerraformOutput(this, "ecrRepoUrl", { value: ecrRepo.repositoryUrl });
     new TerraformOutput(this, "ecsClusterName", { value: ecsCluster.name });
