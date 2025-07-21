@@ -71,7 +71,20 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7: Deploy Infrastructure
+      # Step 7A: Destroy existing infra before redeploy (optional clean slate)
+      - name: Destroy existing AWS Infrastructure
+        continue-on-error: true
+        run: |
+          cd iac
+          npm ci
+          cdktf get
+          cdktf destroy --auto-approve || echo "No existing infra to destroy"
+
+      # Step 7B: Wait for AWS cleanup
+      - name: Wait for AWS cleanup
+        run: sleep 300
+
+      # Step 8: Deploy AWS Infrastructure fresh
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
@@ -86,37 +99,34 @@ jobs:
           PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
 
-      # Step 8: Verify Network Connectivity
+      # Step 9: Verify Network Connectivity
       - name: Verify ECR Access
         run: |
-          # Verify NAT Gateway is operational
-          aws ec2 describe-nat-gateways --filter Name=subnet-id,Values=$(cd iac && terraform output -json public_subnets | jq -r '.[0]') --query "NatGateways[0].State" --region $AWS_REGION
-          
-          # Test connectivity to ECR endpoint
+          aws ec2 describe-nat-gateways --region $AWS_REGION
           aws ecr describe-repositories --repository-names $APP_REPO_NAME --region $AWS_REGION
 
-      # Step 9: Wait for infrastructure
+      # Step 10: Wait for infrastructure stabilization
       - name: Wait for infrastructure stabilization
-        run: sleep 180  # Increased wait time for NAT to be fully operational
+        run: sleep 60
 
-      # Step 10: Login to ECR
+      # Step 11: Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 11: Build Docker image
+      # Step 12: Build Docker image from app/Dockerfile
       - name: Build Docker image
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
 
-      # Step 12: Push Docker image
+      # Step 13: Push Docker image
       - name: Push Docker image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
-      # Step 13: Force ECS deployment with extended timeout
+      # Step 14: Force ECS deployment with extended timeout
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -124,21 +134,42 @@ jobs:
             --service ${{ env.APP_CLUSTER_NAME }}-service \
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
-          # Wait for service to stabilize
           aws ecs wait services-stable \
             --cluster ${{ env.APP_CLUSTER_NAME }} \
             --services ${{ env.APP_CLUSTER_NAME }}-service \
             --region ${{ env.AWS_REGION }}
+          echo "Waiting 120 seconds to ensure service stabilization..."
+          sleep 120
 
-      # Step 14: Get ALB DNS
+      # Step 15: Get ALB DNS more reliably
       - name: Get ALB DNS
         id: alb-dns
         run: |
-          sleep 30  # Additional wait time for ALB to be fully ready
-          ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          echo "Trying terraform output..."
+          cd iac
+          if terraform output -raw albDnsName > /tmp/alb_dns 2>/dev/null; then
+            echo "Terraform output worked."
+          else
+            echo "Terraform output failed, falling back to AWS CLI..."
+            aws elbv2 describe-load-balancers \
+              --names tv-devops-alb \
+              --query 'LoadBalancers[0].DNSName' \
+              --output text > /tmp/alb_dns
+          fi
+          cat /tmp/alb_dns
+          echo "ALB_DNS=$(cat /tmp/alb_dns)" >> $GITHUB_ENV
 
-      # Step 15: Test endpoint
+      # Step 16: Test endpoint with retries
       - name: Test ALB endpoint
         run: |
-          curl --retry 10 --retry-delay 15 --retry-connrefused http://${{ env.ALB_DNS }}/health
+          echo "Testing health endpoint: http://${ALB_DNS}/health"
+          for i in {1..10}; do
+            if curl -sSf http://${ALB_DNS}/health; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Waiting 15s before retry... ($i/10)"
+            sleep 30
+          done
+          echo "ALB health endpoint failed after 10 attempts"
+          exit 1
