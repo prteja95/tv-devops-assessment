@@ -71,72 +71,81 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7: Comprehensive Cleanup Before Deployment
-      - name: Cleanup Existing AWS Resources
+      # Step 7: Comprehensive Pre-Deployment Cleanup
+      - name: Cleanup Existing all AWS Resources from previous deployement
         continue-on-error: true
         run: |
-          # 1. Clean up orphaned Internet Gateways
-          echo "Cleaning up unattached Internet Gateways..."
-          IGW_IDS=$(aws ec2 describe-internet-gateways \
-            --filters "Name=attachment.vpc-id,Values=" \
-            --query "InternetGateways[].InternetGatewayId" \
-            --output text)
-          
-          for IGW_ID in $IGW_IDS; do
-            echo "Deleting unattached IGW: $IGW_ID"
-            aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID || echo "IGW deletion failed, continuing..."
-          done
-
-          # 2. Clean up ALB resources
-          echo "Cleaning up ALB resources..."
-          ALB_ARN=$(aws elbv2 describe-load-balancers \
-            --names tv-devops-alb \
-            --query 'LoadBalancers[0].LoadBalancerArn' \
-            --output text 2>/dev/null || echo "")
-          
-          if [ -n "$ALB_ARN" ]; then
-            echo "Deleting ALB: $ALB_ARN"
-            aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN
-            aws elbv2 wait load-balancers-deleted --load-balancer-arns $ALB_ARN
-          fi
-
-          # 3. Clean up NAT Gateways
-          echo "Cleaning up NAT Gateways..."
-          NAT_GW_IDS=$(aws ec2 describe-nat-gateways \
-            --filter "Name=state,Values=failed,available" \
-            --query "NatGateways[].NatGatewayId" \
-            --output text)
-          
-          for NAT_GW_ID in $NAT_GW_IDS; do
-            echo "Deleting NAT Gateway: $NAT_GW_ID"
-            aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GW_ID || echo "NAT GW deletion failed, continuing..."
-          done
-
-          # 4. Clean up VPC attachments
-          echo "Cleaning up VPC attachments..."
-          VPC_ID=$(aws ec2 describe-vpcs \
+          # 1. Clean up existing VPC and related resources
+          echo "Checking for existing VPC..."
+          EXISTING_VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Name,Values=tv-devops-vpc" \
             --query "Vpcs[0].VpcId" \
             --output text 2>/dev/null || echo "")
           
-          if [ -n "$VPC_ID" ]; then
-            # Detach IGWs
-            ATTACHED_IGWS=$(aws ec2 describe-internet-gateways \
-              --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+          if [ -n "$EXISTING_VPC_ID" ]; then
+            echo "Found existing VPC ($EXISTING_VPC_ID), cleaning up resources..."
+            
+            # 1a. Delete ALB and related resources
+            echo "Cleaning up ALB resources..."
+            ALB_ARN=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?VpcId=='$EXISTING_VPC_ID'].LoadBalancerArn" \
+              --output text)
+            if [ -n "$ALB_ARN" ]; then
+              aws elbv2 delete-load-balancer --load-balancer-arn $ALB_ARN || echo "ALB deletion failed, continuing..."
+              aws elbv2 wait load-balancers-deleted --load-balancer-arns $ALB_ARN || echo "ALB wait failed"
+            fi
+            
+            # 1b. Delete NAT Gateways
+            echo "Cleaning up NAT Gateways..."
+            NAT_GW_IDS=$(aws ec2 describe-nat-gateways \
+              --filter "Name=vpc-id,Values=$EXISTING_VPC_ID" \
+              --query "NatGateways[].NatGatewayId" \
+              --output text)
+            for NAT_GW_ID in $NAT_GW_IDS; do
+              aws ec2 delete-nat-gateway --nat-gateway-id $NAT_GW_ID || echo "Failed to delete NAT GW $NAT_GW_ID"
+            done
+            
+            # 1c. Detach and delete Internet Gateways
+            echo "Cleaning up Internet Gateways..."
+            IGW_IDS=$(aws ec2 describe-internet-gateways \
+              --filters "Name=attachment.vpc-id,Values=$EXISTING_VPC_ID" \
               --query "InternetGateways[].InternetGatewayId" \
               --output text)
-            
-            for IGW_ID in $ATTACHED_IGWS; do
-              echo "Detaching IGW $IGW_ID from VPC $VPC_ID"
-              aws ec2 detach-internet-gateway \
-                --internet-gateway-id $IGW_ID \
-                --vpc-id $VPC_ID || echo "Detach failed, continuing..."
+            for IGW_ID in $IGW_IDS; do
+              aws ec2 detach-internet-gateway --internet-gateway-id $IGW_ID --vpc-id $EXISTING_VPC_ID || echo "Detach failed"
+              aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID || echo "Delete failed"
             done
+            
+            # 1d. Delete VPC (will fail if dependencies still exist)
+            echo "Attempting to delete VPC..."
+            aws ec2 delete-vpc --vpc-id $EXISTING_VPC_ID || echo "VPC deletion failed (may have remaining dependencies)"
           fi
+          
+          # 2. Clean up CloudWatch Log Groups
+          echo "Cleaning up CloudWatch Log Groups..."
+          aws logs delete-log-group \
+            --log-group-name "/ecs/tv-devops-cluster" 2>/dev/null || echo "Log group not found or already deleted"
+          
+          # 3. Clean up ECR Repository
+          echo "Cleaning up ECR Repository..."
+          aws ecr delete-repository \
+            --repository-name "tv-devops-app" \
+            --force 2>/dev/null || echo "ECR repository not found or already deleted"
+          
+          # 4. Clean up any remaining unattached IGWs (VPC limit prevention)
+          echo "Cleaning up unattached Internet Gateways..."
+          UNATTACHED_IGWS=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=" \
+            --query "InternetGateways[].InternetGatewayId" \
+            --output text)
+          for IGW_ID in $UNATTACHED_IGWS; do
+            aws ec2 delete-internet-gateway --internet-gateway-id $IGW_ID || echo "Could not delete IGW $IGW_ID"
+          done
+          
+          echo "Cleanup complete. Waiting for AWS resource propagation..."
+          sleep 60
         env:
           AWS_REGION: ${{ env.AWS_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       # Step 8: Wait for cleanup completion
       - name: Wait for resource cleanup
