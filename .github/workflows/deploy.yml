@@ -183,28 +183,95 @@ jobs:
             --region ${{ env.AWS_REGION }}
           sleep 120
 
-      # Step 16: Get ALB DNS
+      # Step 16: Get ALB DNS with robust error handling
       - name: Get ALB DNS
         id: alb-dns
         run: |
-          cd iac
-          terraform output -raw albDnsName > /tmp/alb_dns 2>/dev/null || \
-          aws elbv2 describe-load-balancers \
-            --names tv-devops-alb \
-            --query 'LoadBalancers[0].DNSName' \
-            --output text > /tmp/alb_dns
-          echo "ALB_DNS=$(cat /tmp/alb_dns)" >> $GITHUB_ENV
+          echo "Attempting to get ALB DNS..."
+          # Try multiple methods to get ALB DNS
+          DNS_NAME=""
+          
+          # Method 1: Try terraform output
+          if [ -d "iac" ]; then
+            cd iac
+            DNS_NAME=$(terraform output -raw albDnsName 2>/dev/null || echo "")
+            cd ..
+          fi
+          
+          # Method 2: Try AWS CLI if terraform failed
+          if [ -z "$DNS_NAME" ]; then
+            echo "Falling back to AWS CLI..."
+            DNS_NAME=$(aws elbv2 describe-load-balancers \
+              --region ${{ env.AWS_REGION }} \
+              --names tv-devops-alb \
+              --query 'LoadBalancers[0].DNSName' \
+              --output text 2>/dev/null || echo "")
+          fi
+          
+          # Method 3: Try generic describe if named lookup failed
+          if [ -z "$DNS_NAME" ]; then
+            echo "Falling back to generic ALB lookup..."
+            DNS_NAME=$(aws elbv2 describe-load-balancers \
+              --region ${{ env.AWS_REGION }} \
+              --query 'LoadBalancers[?contains(LoadBalancerName,`tv-devops`)].DNSName' \
+              --output text 2>/dev/null || echo "")
+          fi
+          
+          if [ -z "$DNS_NAME" ]; then
+            echo "ERROR: Could not retrieve ALB DNS name"
+            exit 1
+          fi
+          
+          echo "ALB DNS Name: $DNS_NAME"
+          echo "ALB_DNS=$DNS_NAME" >> $GITHUB_ENV
 
-      # Step 17: Test endpoint
+      # Step 17: Test endpoint with enhanced retry logic
       - name: Test ALB endpoint
         run: |
-          for i in {1..10}; do
-            if curl -sSf http://${ALB_DNS}/health; then
-              echo "Health check passed"
+          echo "Starting ALB health check..."
+          MAX_RETRIES=15
+          RETRY_DELAY=20
+          HEALTH_ENDPOINT="http://${ALB_DNS}/health"
+          
+          for ((i=1; i<=$MAX_RETRIES; i++)); do
+            echo "Attempt $i/$MAX_RETRIES: Testing $HEALTH_ENDPOINT"
+            
+            # Use curl with timeout and detailed error reporting
+            if curl -sSf --connect-timeout 10 --max-time 15 "$HEALTH_ENDPOINT"; then
+              echo "Health check passed successfully"
               exit 0
+            else
+              CURL_EXIT_CODE=$?
+              echo "Health check failed (curl exit code: $CURL_EXIT_CODE)"
+              
+              # Additional debugging for common curl errors
+              case $CURL_EXIT_CODE in
+                6) echo "Error: Could not resolve host";;
+                7) echo "Error: Failed to connect to host";;
+                28) echo "Error: Connection timed out";;
+                *) echo "Error: Unknown curl error";;
+              esac
+              
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Waiting $RETRY_DELAY seconds before next attempt..."
+                sleep $RETRY_DELAY
+                
+                # Optional: Verify ALB state
+                echo "Current ALB state:"
+                aws elbv2 describe-load-balancers \
+                  --region ${{ env.AWS_REGION }} \
+                  --names tv-devops-alb \
+                  --query 'LoadBalancers[0].State.Code' \
+                  --output text || echo "ALB status check failed"
+              fi
             fi
-            echo "Attempt $i/10 - Waiting 30s before retry..."
-            sleep 30
           done
-          echo "ALB health check failed after 10 attempts"
+          
+          echo "ALB health check failed after $MAX_RETRIES attempts"
+          echo "Final ALB state:"
+          aws elbv2 describe-load-balancers \
+            --region ${{ env.AWS_REGION }} \
+            --names tv-devops-alb \
+            --query 'LoadBalancers[0]' \
+            --output json
           exit 1
