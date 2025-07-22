@@ -28,6 +28,12 @@ import { IamRolePolicyAttachment } from "./.gen/providers/aws/iam-role-policy-at
 import { EcsTaskDefinition } from "./.gen/providers/aws/ecs-task-definition";
 import { EcsService } from "./.gen/providers/aws/ecs-service";
 import { CloudwatchLogGroup } from "./.gen/providers/aws/cloudwatch-log-group";
+import { CloudwatchMetricAlarm } from "./.gen/providers/aws/cloudwatch-metric-alarm";
+import { AcmCertificate } from "./.gen/providers/aws/acm-certificate";
+import { AcmCertificateValidation } from "./.gen/providers/aws/acm-certificate-validation";
+import { Route53Record } from "./.gen/providers/aws/route53-record";
+import { Route53Zone } from "./.gen/providers/aws/route53-zone";
+import { S3Backend } from "cdktf"; 
 
 // Validate env vars
 function validateEnv(vars: string[]) {
@@ -45,12 +51,23 @@ validateEnv([
   "PUBLIC_SUBNET_CIDR_A",
   "PUBLIC_SUBNET_CIDR_B",
   "PRIVATE_SUBNET_CIDR_A",
-  "PRIVATE_SUBNET_CIDR_B"
+  "PRIVATE_SUBNET_CIDR_B",
+  "DOMAIN_NAME",
+  "TF_STATE_BUCKET"
 ]);
 
 class TvDevOpsStack extends TerraformStack {
   constructor(scope: Construct, id: string) {
     super(scope, id);
+    //  S3 backend configuration
+    new S3Backend(this, {
+      bucket: process.env.TF_STATE_BUCKET!,
+      key: "terraform.tfstate",
+      region: process.env.AWS_REGION!,
+      encrypt: true,
+      // Optional: Add if using DynamoDB for state locking in PROD,here excluded since it is a demo for interview.
+      // dynamodbTable: "terraform-lock-table"
+    });
 
     // Common tags for all taggable resources
     const appClusterName = process.env.APP_CLUSTER_NAME!;
@@ -71,9 +88,10 @@ class TvDevOpsStack extends TerraformStack {
     const pubCidrB = process.env.PUBLIC_SUBNET_CIDR_B!;
     const privCidrA = process.env.PRIVATE_SUBNET_CIDR_A!;
     const privCidrB = process.env.PRIVATE_SUBNET_CIDR_B!;
+    const domainName = process.env.DOMAIN_NAME!;
 
     const appRepoName = process.env.APP_REPO_NAME!;
-    const imageTag = process.env.APP_IMAGE_TAG!;
+    const imageTag = process.env.APP_IMAGE_TAG || "latest"; // Default to 'latest' if not specified
 
     const containerPort = Number(process.env.CONTAINER_PORT || "3000");
     const desiredTasks = Number(process.env.DESIRED_TASKS || "1");
@@ -90,7 +108,7 @@ class TvDevOpsStack extends TerraformStack {
 
     new AwsProvider(this, "aws", { region });
 
-    // VPC with tags
+    // VPC Resources
     const vpc = new Vpc(this, "customVpc", {
       cidrBlock: vpcCidr,
       enableDnsHostnames: true,
@@ -98,13 +116,13 @@ class TvDevOpsStack extends TerraformStack {
       tags: { ...commonTags, Name: "tv-devops-vpc" }
     });
 
-    // Internet Gateway with tags
+    // Internet Gateway
     const igw = new InternetGateway(this, "igw", { 
       vpcId: vpc.id,
       tags: commonTags
     });
 
-    // Public Subnets with tags
+    // Public Subnets
     const publicSubnetA = new Subnet(this, "publicSubnetA", {
       vpcId: vpc.id,
       cidrBlock: pubCidrA,
@@ -120,20 +138,18 @@ class TvDevOpsStack extends TerraformStack {
       tags: { ...commonTags, Name: "public-subnet-b" }
     });
 
-    // Public Route Table with tags
+    // Public Route Table
     const publicRT = new RouteTable(this, "publicRT", { 
       vpcId: vpc.id,
       tags: commonTags
     });
     
-    // Route doesn't support tags
     new Route(this, "publicInternetRoute", {
       routeTableId: publicRT.id,
       destinationCidrBlock: "0.0.0.0/0",
       gatewayId: igw.id
     });
 
-    // Route table associations don't support tags
     new RouteTableAssociation(this, "pubAssocA", { 
       subnetId: publicSubnetA.id, 
       routeTableId: publicRT.id 
@@ -143,7 +159,7 @@ class TvDevOpsStack extends TerraformStack {
       routeTableId: publicRT.id 
     });
 
-    // NAT Gateway with tags
+    // NAT Gateway
     const natEip = new Eip(this, "natEip", { 
       domain: "vpc",
       tags: commonTags
@@ -154,7 +170,7 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // Private Subnets with tags
+    // Private Subnets
     const privateSubnetA = new Subnet(this, "privateSubnetA", {
       vpcId: vpc.id,
       cidrBlock: privCidrA,
@@ -168,20 +184,18 @@ class TvDevOpsStack extends TerraformStack {
       tags: { ...commonTags, Name: "private-subnet-b" }
     });
 
-    // Private Route Table with tags
+    // Private Route Table
     const privateRT = new RouteTable(this, "privateRT", { 
       vpcId: vpc.id,
       tags: commonTags
     });
     
-    // Route doesn't support tags
     new Route(this, "privateNatRoute", {
       routeTableId: privateRT.id,
       destinationCidrBlock: "0.0.0.0/0",
       natGatewayId: natGw.id
     });
 
-    // Route table associations don't support tags
     new RouteTableAssociation(this, "privAssocA", { 
       subnetId: privateSubnetA.id, 
       routeTableId: privateRT.id 
@@ -194,13 +208,13 @@ class TvDevOpsStack extends TerraformStack {
     const publicSubnets = [publicSubnetA.id, publicSubnetB.id];
     const privateSubnets = [privateSubnetA.id, privateSubnetB.id];
 
-    // ECS Cluster with tags
+    // ECS Cluster
     const ecsCluster = new EcsCluster(this, "ecsCluster", { 
       name: appClusterName,
       tags: commonTags
     });
 
-    // ALB Security Group with tags
+    // Security Groups
     const albSg = new SecurityGroup(this, "albSg", {
       name: "alb-sg",
       description: "Allow inbound HTTP traffic to ALB",
@@ -217,7 +231,6 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // ECS Security Group with tags
     const ecsSg = new SecurityGroup(this, "ecsSg", {
       name: "ecs-tasks-sg",
       description: "Allow only ALB to ECS traffic",
@@ -229,7 +242,6 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // Security Group Rules - don't support tags
     new SecurityGroupRule(this, "albToEcsRule", {
       type: "egress",
       fromPort: containerPort,
@@ -248,13 +260,13 @@ class TvDevOpsStack extends TerraformStack {
       sourceSecurityGroupId: albSg.id
     });
 
-    // ECR Repository with tags
+    // ECR Repository
     const ecrRepo = new EcrRepository(this, "appRepo", { 
       name: appRepoName,
       tags: commonTags
     });
 
-    // ALB with tags
+    // ALB and Target Group
     const alb = new Lb(this, "alb", {
       name: "tv-devops-alb",
       loadBalancerType: "application",
@@ -263,7 +275,6 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // Target Group with tags
     const targetGroup = new LbTargetGroup(this, "tg", {
       name: "ecs-tg",
       port: containerPort,
@@ -280,18 +291,70 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // Listener with tags
-    new LbListener(this, "listener", {
+// HTTPS Certificate
+const hostedZone = new Route53Zone(this, "hostedZone", {
+  name: domainName,
+  tags: commonTags
+});
+
+const certificate = new AcmCertificate(this, "certificate", {
+  domainName: `app.${domainName}`,
+  subjectAlternativeNames: [`*.${domainName}`],
+  validationMethod: "DNS",
+  tags: commonTags
+});
+
+// Get first validation option
+const validationOption = certificate.domainValidationOptions.get(0);
+
+// Create validation record if options exist
+if (validationOption) {
+  new Route53Record(this, "certValidationRecord", {
+    zoneId: hostedZone.zoneId,
+    name: validationOption.resourceRecordName,
+    type: validationOption.resourceRecordType,
+    records: [validationOption.resourceRecordValue],
+    ttl: 60
+  });
+}
+
+// Add certificate validation
+new AcmCertificateValidation(this, "certificateValidation", {
+  certificateArn: certificate.arn,
+  validationRecordFqdns: validationOption ? [validationOption.resourceRecordName] : []
+});
+
+    // Listeners
+    new LbListener(this, "httpListener", {
       loadBalancerArn: alb.arn,
-      port: albPort,
+      port: 80,
       protocol: "HTTP",
-      defaultAction: [{ type: "forward", targetGroupArn: targetGroup.arn }],
+      defaultAction: [{
+        type: "redirect",
+        redirect: {
+          protocol: "HTTPS",
+          port: "443",
+          statusCode: "HTTP_301"
+        }
+      }],
       tags: commonTags
     });
 
-    // IAM Role for ECS Tasks with tags
+    new LbListener(this, "httpsListener", {
+      loadBalancerArn: alb.arn,
+      port: 443,
+      protocol: "HTTPS",
+      certificateArn: certificate.arn,
+      defaultAction: [{
+        type: "forward",
+        targetGroupArn: targetGroup.arn
+      }],
+      tags: commonTags
+    });
+
+    // IAM Roles
     const ecsTaskRole = new IamRole(this, "ecsTaskRole", {
-      name: `ecsTaskRole-${Date.now()}`,
+      name: `ecsTaskRole-${appClusterName}`,
       assumeRolePolicy: JSON.stringify({
         Version: "2012-10-17",
         Statement: [{
@@ -303,20 +366,36 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // IAM Policy Attachment - doesn't support tags
     new IamRolePolicyAttachment(this, "ecsTaskPolicyAttach", {
       role: ecsTaskRole.name,
       policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
     });
 
-    // CloudWatch Log Group with tags
+    // CloudWatch
     const logGroup = new CloudwatchLogGroup(this, "ecsLogGroup", {
       name: `/ecs/${appClusterName}`,
       retentionInDays: logRetention,
       tags: commonTags
     });
 
-    // ECS Task Definition with tags
+    new CloudwatchMetricAlarm(this, "highCpuAlarm", {
+      alarmName: `${appClusterName}-high-cpu`,
+      comparisonOperator: "GreaterThanThreshold",
+      evaluationPeriods: 2,
+      metricName: "CPUUtilization",
+      namespace: "AWS/ECS",
+      period: 300,
+      statistic: "Average",
+      threshold: 80,
+      dimensions: {
+        ClusterName: ecsCluster.name,
+        ServiceName: `${appClusterName}-service`
+      },
+      alarmDescription: "Alarm when CPU exceeds 80%",
+      tags: commonTags
+    });
+
+    // ECS Task Definition
     const ecsTaskDef = new EcsTaskDefinition(this, "ecsTaskDef", {
       family: `${appClusterName}-task`,
       requiresCompatibilities: ["FARGATE"],
@@ -345,7 +424,7 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-    // ECS Service with tags
+    // ECS Service
     new EcsService(this, "ecsService", {
       name: `${appClusterName}-service`,
       cluster: ecsCluster.id,
@@ -357,24 +436,43 @@ class TvDevOpsStack extends TerraformStack {
         securityGroups: [ecsSg.id],
         assignPublicIp: false,
       },
-      loadBalancer: [
-        {
-          targetGroupArn: targetGroup.arn,
-          containerName: "app",
-          containerPort: containerPort,
-        },
-      ],
-      dependsOn: [alb, targetGroup, ecsTaskDef],
+      loadBalancer: [{
+        targetGroupArn: targetGroup.arn,
+        containerName: "app",
+        containerPort: containerPort,
+      }],
+      dependsOn: [alb, targetGroup],
       tags: commonTags
     });
 
     // Outputs
-    new TerraformOutput(this, "albDnsName", { value: alb.dnsName });
-    new TerraformOutput(this, "ecrRepoUrl", { value: ecrRepo.repositoryUrl });
-    new TerraformOutput(this, "ecsClusterName", { value: ecsCluster.name });
-    new TerraformOutput(this, "vpcUsed", { value: vpc.id });
+    new TerraformOutput(this, "albDnsName", { 
+      value: alb.dnsName,
+      description: "ALB DNS name"
+    });
+    new TerraformOutput(this, "appUrl", { 
+      value: `https://app.${domainName}`,
+      description: "Application URL"
+    });
+    new TerraformOutput(this, "ecrRepoUrl", { 
+      value: ecrRepo.repositoryUrl,
+      description: "ECR repository URL"
+    });
+    new TerraformOutput(this, "ecsClusterName", { 
+      value: ecsCluster.name,
+      description: "ECS cluster name"
+    });
+    new TerraformOutput(this, "vpcId", {
+      value: vpc.id,
+      description: "VPC ID"
+    });
+
+
   }
+
+
 }
+
 
 const app = new App();
 new TvDevOpsStack(app, "tv-devops-stack");
