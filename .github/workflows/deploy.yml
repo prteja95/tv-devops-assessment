@@ -17,6 +17,7 @@ env:
   ECS_CPU: ${{ vars.ECS_CPU }}
   ECS_MEMORY: ${{ vars.ECS_MEMORY }}
   LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
 
 jobs:
   deploy:
@@ -80,6 +81,7 @@ jobs:
           cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
           CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
           PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
           PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
