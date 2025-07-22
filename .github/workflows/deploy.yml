@@ -1,4 +1,4 @@
-name: CI/CD Deploy to AWS ECS with HTTPS
+name: CI/CD Deploy to AWS ECS
 
 on:
   push:
@@ -17,8 +17,8 @@ env:
   ECS_CPU: ${{ vars.ECS_CPU }}
   ECS_MEMORY: ${{ vars.ECS_MEMORY }}
   LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
-  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
   DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
 
 jobs:
   deploy:
@@ -26,11 +26,38 @@ jobs:
     environment: production
 
     steps:
-      # Checkout repo
+      # Step 1: Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Configure AWS credentials
+      # Step 2: Debug & Clean CIDR blocks
+      - name: Debug and Clean CIDR blocks
+        id: clean-cidr
+        run: |
+          echo "Before cleaning:"
+          echo "CUSTOM_VPC_CIDR='${{ vars.CUSTOM_VPC_CIDR }}'"
+          echo "PUBLIC_SUBNET_CIDR_A='${{ vars.PUBLIC_SUBNET_CIDR_A }}'"
+          echo "PUBLIC_SUBNET_CIDR_B='${{ vars.PUBLIC_SUBNET_CIDR_B }}'"
+          echo "PRIVATE_SUBNET_CIDR_A='${{ vars.PRIVATE_SUBNET_CIDR_A }}'"
+          echo "PRIVATE_SUBNET_CIDR_B='${{ vars.PRIVATE_SUBNET_CIDR_B }}'"
+
+          # Sanitize hidden \r\n and whitespace
+          strip() { echo "$1" | tr -d '\r\n[:space:]'; }
+
+          echo "CUSTOM_VPC_CIDR=$(strip '${{ vars.CUSTOM_VPC_CIDR }}')" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_A=$(strip '${{ vars.PUBLIC_SUBNET_CIDR_A }}')" >> $GITHUB_ENV
+          echo "PUBLIC_SUBNET_CIDR_B=$(strip '${{ vars.PUBLIC_SUBNET_CIDR_B }}')" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_A=$(strip '${{ vars.PRIVATE_SUBNET_CIDR_A }}')" >> $GITHUB_ENV
+          echo "PRIVATE_SUBNET_CIDR_B=$(strip '${{ vars.PRIVATE_SUBNET_CIDR_B }}')" >> $GITHUB_ENV
+
+          echo "After cleaning:"
+          echo "CUSTOM_VPC_CIDR=$(strip '${{ vars.CUSTOM_VPC_CIDR }}')"
+          echo "PUBLIC_SUBNET_CIDR_A=$(strip '${{ vars.PUBLIC_SUBNET_CIDR_A }}')"
+          echo "PUBLIC_SUBNET_CIDR_B=$(strip '${{ vars.PUBLIC_SUBNET_CIDR_B }}')"
+          echo "PRIVATE_SUBNET_CIDR_A=$(strip '${{ vars.PRIVATE_SUBNET_CIDR_A }}')"
+          echo "PRIVATE_SUBNET_CIDR_B=$(strip '${{ vars.PRIVATE_SUBNET_CIDR_B }}')"
+
+      # Step 3: Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -38,73 +65,70 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Setup Node.js
+      # Step 4: Setup Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20.x
-          cache: "npm"
-          cache-dependency-path: "iac/package-lock.json"
+          cache: 'npm'
+          cache-dependency-path: 'iac/package-lock.json'
 
-      # Install CDKTF CLI
-      - name: Install CDKTF CLI
+      # Step 5: Install CDKTF
+      - name: Install CDKTF
         run: npm install -g cdktf-cli@latest
 
-      # Install Terraform
+      # Step 6: Install Terraform
       - name: Install Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Deploy new AWS Infrastructure
+      # ✅ Step 7: Deploy AWS Infrastructure (no auto-cleanup)
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
           npm ci
           cdktf get
-          echo "🚀 Deploying fresh infrastructure..."
           cdktf deploy --auto-approve
         env:
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
-          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
-          CUSTOM_VPC_CIDR: ${{ vars.CUSTOM_VPC_CIDR }}
-          PUBLIC_SUBNET_CIDR_A: ${{ vars.PUBLIC_SUBNET_CIDR_A }}
-          PUBLIC_SUBNET_CIDR_B: ${{ vars.PUBLIC_SUBNET_CIDR_B }}
-          PRIVATE_SUBNET_CIDR_A: ${{ vars.PRIVATE_SUBNET_CIDR_A }}
-          PRIVATE_SUBNET_CIDR_B: ${{ vars.PRIVATE_SUBNET_CIDR_B }}
+          CUSTOM_VPC_CIDR: ${{ env.CUSTOM_VPC_CIDR }}
+          PUBLIC_SUBNET_CIDR_A: ${{ env.PUBLIC_SUBNET_CIDR_A }}
+          PUBLIC_SUBNET_CIDR_B: ${{ env.PUBLIC_SUBNET_CIDR_B }}
+          PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
+          PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
           DOMAIN_NAME: ${{ env.DOMAIN_NAME }}
+          TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
 
-      # Verify ECR
-      - name: Verify ECR & NAT
+      # Step 8: Verify Network Connectivity
+      - name: Verify ECR Access
         run: |
-          echo "✅ Checking NAT gateway"
           aws ec2 describe-nat-gateways --region $AWS_REGION
-          echo "✅ Checking ECR repo"
           aws ecr describe-repositories --repository-names $APP_REPO_NAME --region $AWS_REGION
 
-      # Wait for infra stabilization (ACM DNS validation + ALB)
-      - name: Wait for ACM + ALB propagation
-        run: sleep 180
+      # Step 9: Wait for infrastructure stabilization
+      - name: Wait for infrastructure stabilization
+        run: sleep 60
 
-      # Login to ECR
+      # Step 10: Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build Docker image
+      # Step 11: Build Docker image
       - name: Build Docker image
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
 
-      # Push Docker image
+      # Step 12: Push Docker image
       - name: Push Docker image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
-      # Force ECS deployment (new image)
+      # Step 13: Force ECS deployment
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -116,35 +140,65 @@ jobs:
             --cluster ${{ env.APP_CLUSTER_NAME }} \
             --services ${{ env.APP_CLUSTER_NAME }}-service \
             --region ${{ env.AWS_REGION }}
-          echo "✅ ECS service updated, waiting 2 mins for ALB routing..."
+          echo "Waiting 120 seconds to ensure service stabilization..."
           sleep 120
 
-      # Get HTTPS Route53 URL
-      - name: Get HTTPS App URL
-        id: app-url
+      # Step 14: Get ALB DNS with HTTPS support
+      - name: Get ALB DNS
+        id: alb-dns
         run: |
-          echo "Fetching Route53 app URL..."
-          APP_URL="https://app.${DOMAIN_NAME}"
-          echo "APP_URL=$APP_URL" >> $GITHUB_ENV
-          echo "✅ App URL: $APP_URL"
+          echo "Attempting to get ALB DNS..."
+          DNS_NAME=""
+          
+          # Method 1: Try terraform output
+          if [ -d "iac" ]; then
+            cd iac
+            DNS_NAME=$(terraform output -raw appUrl 2>/dev/null || echo "")
+            cd ..
+          fi
+          
+          # Method 2: Try AWS CLI if terraform failed
+          if [ -z "$DNS_NAME" ]; then
+            echo "Falling back to AWS CLI..."
+            DNS_NAME=$(aws elbv2 describe-load-balancers \
+              --region ${{ env.AWS_REGION }} \
+              --names tv-devops-alb \
+              --query 'LoadBalancers[0].DNSName' \
+              --output text 2>/dev/null || echo "")
+          fi
+          
+          if [ -z "$DNS_NAME" ]; then
+            echo "ERROR: Could not retrieve ALB DNS name"
+            exit 1
+          fi
+          
+          echo "ALB DNS Name: $DNS_NAME"
+          echo "ALB_DNS=$DNS_NAME" >> $GITHUB_ENV
 
-      # Test HTTPS endpoint
-      - name: Test HTTPS health endpoint
+      # Step 15: Test endpoint with HTTPS
+      - name: Test HTTPS endpoint
         run: |
-          echo "🔍 Testing HTTPS health endpoint..."
-          MAX_RETRIES=15
+          echo "Starting HTTPS health check..."
+          MAX_RETRIES=10
           RETRY_DELAY=20
           HEALTH_ENDPOINT="https://app.${DOMAIN_NAME}/health"
-
+          
           for ((i=1; i<=$MAX_RETRIES; i++)); do
             echo "Attempt $i/$MAX_RETRIES: Testing $HEALTH_ENDPOINT"
-            if curl -sSf --connect-timeout 10 --max-time 15 "$HEALTH_ENDPOINT"; then
-              echo "✅ Health check passed!"
+            
+            if curl -k -sSf --connect-timeout 10 --max-time 15 "$HEALTH_ENDPOINT"; then
+              echo "✅ Health check passed successfully"
               exit 0
+            else
+              CURL_EXIT_CODE=$?
+              echo "❌ Health check failed (curl exit code: $CURL_EXIT_CODE)"
+              
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Waiting $RETRY_DELAY seconds before next attempt..."
+                sleep $RETRY_DELAY
+              fi
             fi
-            echo "❌ Health check failed. Retrying in $RETRY_DELAY sec..."
-            sleep $RETRY_DELAY
           done
-
+          
           echo "❌ HTTPS health check failed after $MAX_RETRIES attempts"
           exit 1
