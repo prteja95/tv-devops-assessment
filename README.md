@@ -24,7 +24,9 @@ Test Endpoint:
 http://localhost:3000/health
 
 
-Expected OUTPUT: {"status":"ok"}
+Expected OUTPUT: {"status":"ok"} or app response :  
+
+## Hello World from Express + TypeScript!
 
 --------------------------------------------------
 ### PART 2 - AWS INFRASTRUCTURE (CDKTF)
@@ -120,6 +122,7 @@ ecrRepoUrl → the ECR repository where you will push your Docker image
 ### Push your application image to ECR
 
 In the app/ folder, build an AWS-compatible image for linux/amd64:
+
 docker buildx build --platform linux/amd64 -t tv-devops-app:v2 .
 
 Tag the image for your ECR repo:
