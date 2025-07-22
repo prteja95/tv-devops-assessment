@@ -32,7 +32,7 @@ import { CloudwatchMetricAlarm } from "./.gen/providers/aws/cloudwatch-metric-al
 import { AcmCertificate } from "./.gen/providers/aws/acm-certificate";
 import { AcmCertificateValidation } from "./.gen/providers/aws/acm-certificate-validation";
 import { Route53Record } from "./.gen/providers/aws/route53-record";
-import { Route53Zone } from "./.gen/providers/aws/route53-zone";
+import { DataAwsRoute53Zone } from "./.gen/providers/aws/data-aws-route53-zone";
 import { S3Backend } from "cdktf"; 
 
 // Validate env vars
@@ -59,14 +59,12 @@ validateEnv([
 class TvDevOpsStack extends TerraformStack {
   constructor(scope: Construct, id: string) {
     super(scope, id);
-    //  S3 backend configuration
+    // S3 backend configuration
     new S3Backend(this, {
       bucket: process.env.TF_STATE_BUCKET!,
       key: "terraform.tfstate",
       region: process.env.AWS_REGION!,
       encrypt: true,
-      // Optional: Add if using DynamoDB for state locking in PROD,here excluded since it is a demo for interview.
-      // dynamodbTable: "terraform-lock-table"
     });
 
     // Common tags for all taggable resources
@@ -89,9 +87,10 @@ class TvDevOpsStack extends TerraformStack {
     const privCidrA = process.env.PRIVATE_SUBNET_CIDR_A!;
     const privCidrB = process.env.PRIVATE_SUBNET_CIDR_B!;
     const domainName = process.env.DOMAIN_NAME!;
+    const existingCertArn = process.env.EXISTING_CERTIFICATE_ARN;
 
     const appRepoName = process.env.APP_REPO_NAME!;
-    const imageTag = process.env.APP_IMAGE_TAG || "latest"; // Default to 'latest' if not specified
+    const imageTag = process.env.APP_IMAGE_TAG || "latest";
 
     const containerPort = Number(process.env.CONTAINER_PORT || "3000");
     const desiredTasks = Number(process.env.DESIRED_TASKS || "1");
@@ -291,38 +290,47 @@ class TvDevOpsStack extends TerraformStack {
       tags: commonTags
     });
 
-// HTTPS Certificate
-const hostedZone = new Route53Zone(this, "hostedZone", {
-  name: domainName,
-  tags: commonTags
-});
+    // Reuse existing hosted zone
+    const hostedZone = new DataAwsRoute53Zone(this, "hostedZone", {
+      name: domainName,
+      privateZone: false,
+    });
 
-const certificate = new AcmCertificate(this, "certificate", {
-  domainName: `app.${domainName}`,
-  subjectAlternativeNames: [`*.${domainName}`],
-  validationMethod: "DNS",
-  tags: commonTags
-});
+    // Certificate logic - reuse existing or create new
+    let certificateArn: string;
+    
+    if (existingCertArn) {
+      // Use existing certificate
+      console.log(`Using existing certificate: ${existingCertArn}`);
+      certificateArn = existingCertArn;
+    } else {
+      // Create new certificate
+      console.log("Creating new ACM certificate");
+      const certificate = new AcmCertificate(this, "certificate", {
+        domainName: `app.${domainName}`,
+        subjectAlternativeNames: [`*.${domainName}`],
+        validationMethod: "DNS",
+        tags: commonTags
+      });
 
-// Get first validation option
-const validationOption = certificate.domainValidationOptions.get(0);
+      const validationOption = certificate.domainValidationOptions.get(0);
+      if (validationOption) {
+        new Route53Record(this, "certValidationRecord", {
+          zoneId: hostedZone.zoneId,
+          name: validationOption.resourceRecordName,
+          type: validationOption.resourceRecordType,
+          records: [validationOption.resourceRecordValue],
+          ttl: 60
+        });
+      }
 
-// Create validation record if options exist
-if (validationOption) {
-  new Route53Record(this, "certValidationRecord", {
-    zoneId: hostedZone.zoneId,
-    name: validationOption.resourceRecordName,
-    type: validationOption.resourceRecordType,
-    records: [validationOption.resourceRecordValue],
-    ttl: 60
-  });
-}
+      new AcmCertificateValidation(this, "certificateValidation", {
+        certificateArn: certificate.arn,
+        validationRecordFqdns: validationOption ? [validationOption.resourceRecordName] : []
+      });
 
-// Add certificate validation
-new AcmCertificateValidation(this, "certificateValidation", {
-  certificateArn: certificate.arn,
-  validationRecordFqdns: validationOption ? [validationOption.resourceRecordName] : []
-});
+      certificateArn = certificate.arn;
+    }
 
     // Listeners
     new LbListener(this, "httpListener", {
@@ -344,7 +352,7 @@ new AcmCertificateValidation(this, "certificateValidation", {
       loadBalancerArn: alb.arn,
       port: 443,
       protocol: "HTTPS",
-      certificateArn: certificate.arn,
+      certificateArn: certificateArn,
       defaultAction: [{
         type: "forward",
         targetGroupArn: targetGroup.arn
@@ -466,13 +474,12 @@ new AcmCertificateValidation(this, "certificateValidation", {
       value: vpc.id,
       description: "VPC ID"
     });
-
-
+    new TerraformOutput(this, "certificateArn", {
+      value: certificateArn,
+      description: "Certificate ARN used for HTTPS"
+    });
   }
-
-
 }
-
 
 const app = new App();
 new TvDevOpsStack(app, "tv-devops-stack");
