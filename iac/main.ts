@@ -56,7 +56,7 @@ validateEnv([
   "PRIVATE_SUBNET_CIDR_B",
   // "DOMAIN_NAME",
   // "EXISTING_CERTIFICATE_ARN",
-  // "TF_STATE_BUCKET",
+  "TF_STATE_BUCKET",
 ]);
 
 class TvDevOpsStack extends TerraformStack {
