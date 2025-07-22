@@ -29,11 +29,13 @@ import { EcsTaskDefinition } from "./.gen/providers/aws/ecs-task-definition";
 import { EcsService } from "./.gen/providers/aws/ecs-service";
 import { CloudwatchLogGroup } from "./.gen/providers/aws/cloudwatch-log-group";
 import { CloudwatchMetricAlarm } from "./.gen/providers/aws/cloudwatch-metric-alarm";
-import { AcmCertificate } from "./.gen/providers/aws/acm-certificate";
-import { AcmCertificateValidation } from "./.gen/providers/aws/acm-certificate-validation";
-import { Route53Record } from "./.gen/providers/aws/route53-record";
-import { DataAwsRoute53Zone } from "./.gen/providers/aws/data-aws-route53-zone";
-import { S3Backend } from "cdktf"; 
+// HTTPS / DNS imports — commented out until you’re ready
+// import { AcmCertificate } from "./.gen/providers/aws/acm-certificate";
+// import { AcmCertificateValidation } from "./.gen/providers/aws/acm-certificate-validation";
+// import { Route53Record } from "./.gen/providers/aws/route53-record";
+// import { DataAwsRoute53Zone } from "./.gen/providers/aws/data-aws-route53-zone";
+
+import { S3Backend } from "cdktf";
 
 // Validate env vars
 function validateEnv(vars: string[]) {
@@ -52,14 +54,16 @@ validateEnv([
   "PUBLIC_SUBNET_CIDR_B",
   "PRIVATE_SUBNET_CIDR_A",
   "PRIVATE_SUBNET_CIDR_B",
-  "DOMAIN_NAME",
-  "TF_STATE_BUCKET"
+  // "DOMAIN_NAME",
+  // "EXISTING_CERTIFICATE_ARN",
+  // "TF_STATE_BUCKET",
 ]);
 
 class TvDevOpsStack extends TerraformStack {
   constructor(scope: Construct, id: string) {
     super(scope, id);
-    // S3 backend configuration
+
+    // S3 backend configuration (keep your bucket manually created)
     new S3Backend(this, {
       bucket: process.env.TF_STATE_BUCKET!,
       key: "terraform.tfstate",
@@ -67,15 +71,15 @@ class TvDevOpsStack extends TerraformStack {
       encrypt: true,
     });
 
-    // Common tags for all taggable resources
+    // Common tags
     const appClusterName = process.env.APP_CLUSTER_NAME!;
     const commonTags = {
-      "Project": "tv-devops",
-      "Environment": "production",
-      "ManagedBy": "cdktf",
-      "AppName": appClusterName,
-      "Owner": "devops-team",
-      "CostCenter": "it-1234"
+      Project: "tv-devops",
+      Environment: "production",
+      ManagedBy: "cdktf",
+      AppName: appClusterName,
+      Owner: "devops-team",
+      CostCenter: "it-1234",
     };
 
     // Load env
@@ -86,8 +90,7 @@ class TvDevOpsStack extends TerraformStack {
     const pubCidrB = process.env.PUBLIC_SUBNET_CIDR_B!;
     const privCidrA = process.env.PRIVATE_SUBNET_CIDR_A!;
     const privCidrB = process.env.PRIVATE_SUBNET_CIDR_B!;
-    const domainName = process.env.DOMAIN_NAME!;
-    const existingCertArn = process.env.EXISTING_CERTIFICATE_ARN;
+    // const domainName = process.env.DOMAIN_NAME!;
 
     const appRepoName = process.env.APP_REPO_NAME!;
     const imageTag = process.env.APP_IMAGE_TAG || "latest";
@@ -107,113 +110,111 @@ class TvDevOpsStack extends TerraformStack {
 
     new AwsProvider(this, "aws", { region });
 
-    // VPC Resources
+    // VPC, IGW, Subnets, RTs, NAT, etc…
     const vpc = new Vpc(this, "customVpc", {
       cidrBlock: vpcCidr,
       enableDnsHostnames: true,
       enableDnsSupport: true,
-      tags: { ...commonTags, Name: "tv-devops-vpc" }
+      tags: { ...commonTags, Name: "tv-devops-vpc" },
     });
 
-    // Internet Gateway
-    const igw = new InternetGateway(this, "igw", { 
+    const igw = new InternetGateway(this, "igw", {
       vpcId: vpc.id,
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // Public Subnets
     const publicSubnetA = new Subnet(this, "publicSubnetA", {
       vpcId: vpc.id,
       cidrBlock: pubCidrA,
       availabilityZone: azA,
       mapPublicIpOnLaunch: true,
-      tags: { ...commonTags, Name: "public-subnet-a" }
+      tags: { ...commonTags, Name: "public-subnet-a" },
     });
+
     const publicSubnetB = new Subnet(this, "publicSubnetB", {
       vpcId: vpc.id,
       cidrBlock: pubCidrB,
       availabilityZone: azB,
       mapPublicIpOnLaunch: true,
-      tags: { ...commonTags, Name: "public-subnet-b" }
+      tags: { ...commonTags, Name: "public-subnet-b" },
     });
 
-    // Public Route Table
-    const publicRT = new RouteTable(this, "publicRT", { 
+    const publicRT = new RouteTable(this, "publicRT", {
       vpcId: vpc.id,
-      tags: commonTags
+      tags: commonTags,
     });
-    
+
     new Route(this, "publicInternetRoute", {
       routeTableId: publicRT.id,
       destinationCidrBlock: "0.0.0.0/0",
-      gatewayId: igw.id
+      gatewayId: igw.id,
     });
 
-    new RouteTableAssociation(this, "pubAssocA", { 
-      subnetId: publicSubnetA.id, 
-      routeTableId: publicRT.id 
-    });
-    new RouteTableAssociation(this, "pubAssocB", { 
-      subnetId: publicSubnetB.id, 
-      routeTableId: publicRT.id 
+    new RouteTableAssociation(this, "pubAssocA", {
+      subnetId: publicSubnetA.id,
+      routeTableId: publicRT.id,
     });
 
-    // NAT Gateway
-    const natEip = new Eip(this, "natEip", { 
+    new RouteTableAssociation(this, "pubAssocB", {
+      subnetId: publicSubnetB.id,
+      routeTableId: publicRT.id,
+    });
+
+    const natEip = new Eip(this, "natEip", {
       domain: "vpc",
-      tags: commonTags
+      tags: commonTags,
     });
+
     const natGw = new NatGateway(this, "natGw", {
       allocationId: natEip.allocationId,
       subnetId: publicSubnetA.id,
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // Private Subnets
     const privateSubnetA = new Subnet(this, "privateSubnetA", {
       vpcId: vpc.id,
       cidrBlock: privCidrA,
       availabilityZone: azA,
-      tags: { ...commonTags, Name: "private-subnet-a" }
+      tags: { ...commonTags, Name: "private-subnet-a" },
     });
+
     const privateSubnetB = new Subnet(this, "privateSubnetB", {
       vpcId: vpc.id,
       cidrBlock: privCidrB,
       availabilityZone: azB,
-      tags: { ...commonTags, Name: "private-subnet-b" }
+      tags: { ...commonTags, Name: "private-subnet-b" },
     });
 
-    // Private Route Table
-    const privateRT = new RouteTable(this, "privateRT", { 
+    const privateRT = new RouteTable(this, "privateRT", {
       vpcId: vpc.id,
-      tags: commonTags
+      tags: commonTags,
     });
-    
+
     new Route(this, "privateNatRoute", {
       routeTableId: privateRT.id,
       destinationCidrBlock: "0.0.0.0/0",
-      natGatewayId: natGw.id
+      natGatewayId: natGw.id,
     });
 
-    new RouteTableAssociation(this, "privAssocA", { 
-      subnetId: privateSubnetA.id, 
-      routeTableId: privateRT.id 
+    new RouteTableAssociation(this, "privAssocA", {
+      subnetId: privateSubnetA.id,
+      routeTableId: privateRT.id,
     });
-    new RouteTableAssociation(this, "privAssocB", { 
-      subnetId: privateSubnetB.id, 
-      routeTableId: privateRT.id 
+
+    new RouteTableAssociation(this, "privAssocB", {
+      subnetId: privateSubnetB.id,
+      routeTableId: privateRT.id,
     });
 
     const publicSubnets = [publicSubnetA.id, publicSubnetB.id];
     const privateSubnets = [privateSubnetA.id, privateSubnetB.id];
 
-    // ECS Cluster
-    const ecsCluster = new EcsCluster(this, "ecsCluster", { 
+    // ECS Cluster + SGs + ECR + ALB + TG
+    const ecsCluster = new EcsCluster(this, "ecsCluster", {
       name: appClusterName,
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // Security Groups
     const albSg = new SecurityGroup(this, "albSg", {
       name: "alb-sg",
       description: "Allow inbound HTTP traffic to ALB",
@@ -224,10 +225,8 @@ class TvDevOpsStack extends TerraformStack {
         protocol: "tcp",
         cidrBlocks: [cidr],
       })),
-      egress: [
-        { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
-      ],
-      tags: commonTags
+      egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }],
+      tags: commonTags,
     });
 
     const ecsSg = new SecurityGroup(this, "ecsSg", {
@@ -235,10 +234,8 @@ class TvDevOpsStack extends TerraformStack {
       description: "Allow only ALB to ECS traffic",
       vpcId: vpc.id,
       ingress: [],
-      egress: [
-        { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
-      ],
-      tags: commonTags
+      egress: [{ fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }],
+      tags: commonTags,
     });
 
     new SecurityGroupRule(this, "albToEcsRule", {
@@ -247,7 +244,7 @@ class TvDevOpsStack extends TerraformStack {
       toPort: containerPort,
       protocol: "tcp",
       securityGroupId: albSg.id,
-      sourceSecurityGroupId: ecsSg.id
+      sourceSecurityGroupId: ecsSg.id,
     });
 
     new SecurityGroupRule(this, "ecsFromAlbRule", {
@@ -256,22 +253,20 @@ class TvDevOpsStack extends TerraformStack {
       toPort: containerPort,
       protocol: "tcp",
       securityGroupId: ecsSg.id,
-      sourceSecurityGroupId: albSg.id
+      sourceSecurityGroupId: albSg.id,
     });
 
-    // ECR Repository
-    const ecrRepo = new EcrRepository(this, "appRepo", { 
+    const ecrRepo = new EcrRepository(this, "appRepo", {
       name: appRepoName,
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // ALB and Target Group
     const alb = new Lb(this, "alb", {
       name: "tv-devops-alb",
       loadBalancerType: "application",
       subnets: publicSubnets,
       securityGroups: [albSg.id],
-      tags: commonTags
+      tags: commonTags,
     });
 
     const targetGroup = new LbTargetGroup(this, "tg", {
@@ -287,103 +282,90 @@ class TvDevOpsStack extends TerraformStack {
         interval: 30,
         timeout: 5,
       },
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // Reuse existing hosted zone
-    const hostedZone = new DataAwsRoute53Zone(this, "hostedZone", {
-      name: domainName,
-      privateZone: false,
-    });
-
-    // Certificate logic - reuse existing or create new
-    let certificateArn: string;
-    
-    if (existingCertArn) {
-      // Use existing certificate
-      console.log(`Using existing certificate: ${existingCertArn}`);
-      certificateArn = existingCertArn;
-    } else {
-      // Create new certificate
-      console.log("Creating new ACM certificate");
-      const certificate = new AcmCertificate(this, "certificate", {
-        domainName: `app.${domainName}`,
-        subjectAlternativeNames: [`*.${domainName}`],
-        validationMethod: "DNS",
-        tags: commonTags
-      });
-
-      const validationOption = certificate.domainValidationOptions.get(0);
-      if (validationOption) {
-        new Route53Record(this, "certValidationRecord", {
-          zoneId: hostedZone.zoneId,
-          name: validationOption.resourceRecordName,
-          type: validationOption.resourceRecordType,
-          records: [validationOption.resourceRecordValue],
-          ttl: 60
-        });
-      }
-
-      new AcmCertificateValidation(this, "certificateValidation", {
-        certificateArn: certificate.arn,
-        validationRecordFqdns: validationOption ? [validationOption.resourceRecordName] : []
-      });
-
-      certificateArn = certificate.arn;
-    }
-
-    // Listeners
+    // HTTP listener only:
     new LbListener(this, "httpListener", {
       loadBalancerArn: alb.arn,
       port: 80,
       protocol: "HTTP",
-      defaultAction: [{
-        type: "redirect",
-        redirect: {
-          protocol: "HTTPS",
-          port: "443",
-          statusCode: "HTTP_301"
+      defaultAction: [{ type: "forward", targetGroupArn: targetGroup.arn }],
+      tags: commonTags,
+    });
+
+    // HTTPS listener & DNS → commented out until ENABLE_HTTPS = true
+    /*
+    const enableHttps = process.env.ENABLE_HTTPS === "true";
+    if (enableHttps) {
+      // look up existing hosted zone:
+      const hostedZone = new DataAwsRoute53Zone(this, "hostedZone", {
+        name: domainName,
+      });
+
+      // issue or reuse certificate:
+      let certificateArn = process.env.EXISTING_CERTIFICATE_ARN!;
+      if (!certificateArn) {
+        const cert = new AcmCertificate(this, "certificate", {
+          domainName: `app.${domainName}`,
+          subjectAlternativeNames: [`*.${domainName}`],
+          validationMethod: "DNS",
+        });
+        const vo = cert.domainValidationOptions.get(0);
+        if (vo) {
+          new Route53Record(this, "certValidationRecord", {
+            zoneId: hostedZone.zoneId,
+            name: vo.resourceRecordName,
+            type: vo.resourceRecordType,
+            records: [vo.resourceRecordValue],
+            ttl: 60,
+          });
         }
-      }],
-      tags: commonTags
-    });
+        new AcmCertificateValidation(this, "certificateValidation", {
+          certificateArn: cert.arn,
+          validationRecordFqdns: vo ? [vo.resourceRecordName] : [],
+        });
+        certificateArn = cert.arn;
+      }
 
-    new LbListener(this, "httpsListener", {
-      loadBalancerArn: alb.arn,
-      port: 443,
-      protocol: "HTTPS",
-      certificateArn: certificateArn,
-      defaultAction: [{
-        type: "forward",
-        targetGroupArn: targetGroup.arn
-      }],
-      tags: commonTags
-    });
+      new LbListener(this, "httpsListener", {
+        loadBalancerArn: alb.arn,
+        port: 443,
+        protocol: "HTTPS",
+        certificateArn,
+        defaultAction: [{ type: "forward", targetGroupArn: targetGroup.arn }],
+        tags: commonTags,
+      });
+    }
+    */
 
-    // IAM Roles
+    // IAM, TaskDef, Service, CloudWatch logs + alarms…
+    // (unchanged)
+
     const ecsTaskRole = new IamRole(this, "ecsTaskRole", {
       name: `ecsTaskRole-${appClusterName}`,
       assumeRolePolicy: JSON.stringify({
         Version: "2012-10-17",
-        Statement: [{
-          Effect: "Allow",
-          Principal: { Service: "ecs-tasks.amazonaws.com" },
-          Action: "sts:AssumeRole",
-        }],
+        Statement: [
+          {
+            Effect: "Allow",
+            Principal: { Service: "ecs-tasks.amazonaws.com" },
+            Action: "sts:AssumeRole",
+          },
+        ],
       }),
-      tags: commonTags
+      tags: commonTags,
     });
 
     new IamRolePolicyAttachment(this, "ecsTaskPolicyAttach", {
       role: ecsTaskRole.name,
-      policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
     });
 
-    // CloudWatch
     const logGroup = new CloudwatchLogGroup(this, "ecsLogGroup", {
       name: `/ecs/${appClusterName}`,
       retentionInDays: logRetention,
-      tags: commonTags
+      tags: commonTags,
     });
 
     new CloudwatchMetricAlarm(this, "highCpuAlarm", {
@@ -397,13 +379,12 @@ class TvDevOpsStack extends TerraformStack {
       threshold: 80,
       dimensions: {
         ClusterName: ecsCluster.name,
-        ServiceName: `${appClusterName}-service`
+        ServiceName: `${appClusterName}-service`,
       },
       alarmDescription: "Alarm when CPU exceeds 80%",
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // ECS Task Definition
     const ecsTaskDef = new EcsTaskDefinition(this, "ecsTaskDef", {
       family: `${appClusterName}-task`,
       requiresCompatibilities: ["FARGATE"],
@@ -416,23 +397,20 @@ class TvDevOpsStack extends TerraformStack {
           name: "app",
           image: `${awsAccountId}.dkr.ecr.${region}.amazonaws.com/${appRepoName}:${imageTag}`,
           essential: true,
-          portMappings: [
-            { containerPort: containerPort, hostPort: containerPort, protocol: "tcp" }
-          ],
+          portMappings: [{ containerPort, hostPort: containerPort, protocol: "tcp" }],
           logConfiguration: {
             logDriver: "awslogs",
             options: {
               "awslogs-group": logGroup.name,
               "awslogs-region": region,
               "awslogs-stream-prefix": "ecs",
-            }
-          }
+            },
+          },
         },
       ]),
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // ECS Service
     new EcsService(this, "ecsService", {
       name: `${appClusterName}-service`,
       cluster: ecsCluster.id,
@@ -444,40 +422,18 @@ class TvDevOpsStack extends TerraformStack {
         securityGroups: [ecsSg.id],
         assignPublicIp: false,
       },
-      loadBalancer: [{
-        targetGroupArn: targetGroup.arn,
-        containerName: "app",
-        containerPort: containerPort,
-      }],
+      loadBalancer: [{ targetGroupArn: targetGroup.arn, containerName: "app", containerPort }],
       dependsOn: [alb, targetGroup],
-      tags: commonTags
+      tags: commonTags,
     });
 
-    // Outputs
-    new TerraformOutput(this, "albDnsName", { 
-      value: alb.dnsName,
-      description: "ALB DNS name"
-    });
-    new TerraformOutput(this, "appUrl", { 
-      value: `https://app.${domainName}`,
-      description: "Application URL"
-    });
-    new TerraformOutput(this, "ecrRepoUrl", { 
-      value: ecrRepo.repositoryUrl,
-      description: "ECR repository URL"
-    });
-    new TerraformOutput(this, "ecsClusterName", { 
-      value: ecsCluster.name,
-      description: "ECS cluster name"
-    });
-    new TerraformOutput(this, "vpcId", {
-      value: vpc.id,
-      description: "VPC ID"
-    });
-    new TerraformOutput(this, "certificateArn", {
-      value: certificateArn,
-      description: "Certificate ARN used for HTTPS"
-    });
+    new TerraformOutput(this, "albDnsName", { value: alb.dnsName });
+    // For now, appUrl can be HTTP:
+    new TerraformOutput(this, "appUrl", { value: `http://${alb.dnsName}/health` });
+
+    new TerraformOutput(this, "ecrRepoUrl", { value: ecrRepo.repositoryUrl });
+    new TerraformOutput(this, "ecsClusterName", { value: ecsCluster.name });
+    new TerraformOutput(this, "vpcId", { value: vpc.id });
   }
 }
 
