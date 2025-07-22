@@ -19,6 +19,7 @@ env:
   LOG_RETENTION_DAYS: ${{ vars.LOG_RETENTION_DAYS }}
   DOMAIN_NAME: ${{ vars.DOMAIN_NAME }}
   TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  EXISTING_CERTIFICATE_ARN: ${{ vars.EXISTING_CERTIFICATE_ARN }}  # Added for certificate reuse
 
 jobs:
   deploy:
@@ -84,7 +85,7 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # ✅ Step 7: Deploy AWS Infrastructure (no auto-cleanup)
+      # ✅ Step 7: Deploy AWS Infrastructure
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
@@ -100,6 +101,7 @@ jobs:
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
           DOMAIN_NAME: ${{ env.DOMAIN_NAME }}
           TF_STATE_BUCKET: ${{ env.TF_STATE_BUCKET }}
+          EXISTING_CERTIFICATE_ARN: ${{ secrets.EXISTING_CERTIFICATE_ARN }}  # Passed to CDKTF
 
       # Step 8: Verify Network Connectivity
       - name: Verify ECR Access
