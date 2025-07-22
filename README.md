@@ -113,30 +113,7 @@ cdktf deploy
 
 The command reads variables from your `.env` file and an existing `TF_STATE_BUCKET` must be set to an S3 bucket for state storage.
 
-## Route53 records and HTTPS listeners will only work once the ACM certificate is in the `ISSUED` state.In my case its still pending thats why i commented out my code for HTTPS test
 
-After deployment you will see outputs:
-albDnsName → the load balancer DNS
-ecrRepoUrl → the ECR repository where you will push your Docker image
-
-### Push your application image to ECR
-
-In the app/ folder, build an AWS-compatible image for linux/amd64:
-
-docker buildx build --platform linux/amd64 -t tv-devops-app:v2 .
-
-Tag the image for your ECR repo:
-docker tag tv-devops-app:v2 <ECR_REPO_URL>:v2
-
-Authenticate Docker to AWS ECR:
-aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
-
-#### Push the image:
-docker push <ECR_REPO_URL>:v2
-
-## Redeploy ECS to pull the new image
-
-aws ecs update-service
 --cluster tv-devops-cluster
 --service tv-devops-cluster-service
 --force-new-deployment
