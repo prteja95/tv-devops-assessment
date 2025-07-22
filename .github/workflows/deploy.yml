@@ -71,7 +71,189 @@ jobs:
           terraform_version: latest
           terraform_wrapper: false
 
-      # Step 7: Deploy Infrastructure
+      # Step 7: Comprehensive Parallel Cleanup
+      - name: Cleanup Existing Resources (Parallel)
+        continue-on-error: true
+        run: |
+          # Set the app name from environment variables
+          APP_NAME="${{ env.APP_CLUSTER_NAME }}"
+          echo "Starting parallel cleanup of resources tagged with AppName=$APP_NAME"
+          
+          # Create temp directory for logs
+          mkdir -p cleanup_logs
+          
+          # Function to run commands in background and track PIDs
+          declare -a PIDS=()
+          
+          function run_in_background() {
+              local command="$1"
+              local log_file="cleanup_logs/${2}.log"
+              echo "Starting: $command"
+              eval "$command" > "$log_file" 2>&1 &
+              PIDS+=($!)
+          }
+          
+          # 1. ALB Cleanup (parallel)
+          run_in_background \
+            "ALB_ARNS=\$(aws resourcegroupstaggingapi get-resources \
+              --tag-filters \"Key=AppName,Values=\$APP_NAME\" \
+              --resource-type-filters elasticloadbalancing:loadbalancer \
+              --query \"ResourceTagMappingList[].ResourceARN\" \
+              --output text) && \
+            for ALB_ARN in \$ALB_ARNS; do \
+              echo \"Deleting ALB \$ALB_ARN\"; \
+              aws elbv2 delete-load-balancer --load-balancer-arn \$ALB_ARN || echo \"ALB deletion failed\"; \
+            done" \
+            "alb_cleanup"
+          
+          # 2. Target Groups Cleanup (parallel)
+          run_in_background \
+            "TG_ARNS=\$(aws resourcegroupstaggingapi get-resources \
+              --tag-filters \"Key=AppName,Values=\$APP_NAME\" \
+              --resource-type-filters elasticloadbalancing:targetgroup \
+              --query \"ResourceTagMappingList[].ResourceARN\" \
+              --output text) && \
+            for TG_ARN in \$TG_ARNS; do \
+              echo \"Deleting Target Group \$TG_ARN\"; \
+              aws elbv2 delete-target-group --target-group-arn \$TG_ARN || echo \"TG deletion failed\"; \
+            done" \
+            "tg_cleanup"
+          
+          # 3. ECS Services Cleanup (parallel)
+          run_in_background \
+            "ECS_SERVICES=\$(aws ecs list-services \
+              --cluster \$APP_NAME \
+              --query \"serviceArns\" \
+              --output text) && \
+            for SERVICE_ARN in \$ECS_SERVICES; do \
+              echo \"Deleting ECS Service \$SERVICE_ARN\"; \
+              aws ecs delete-service --cluster \$APP_NAME --service \$SERVICE_ARN --force || echo \"ECS Service deletion failed\"; \
+            done" \
+            "ecs_services"
+          
+          # 4. ECS Cluster Cleanup (parallel)
+          run_in_background \
+            "if aws ecs describe-clusters --clusters \$APP_NAME --query \"clusters[0].clusterArn\" --output text; then \
+              echo \"Deleting ECS Cluster \$APP_NAME\"; \
+              aws ecs delete-cluster --cluster \$APP_NAME || echo \"ECS Cluster deletion failed\"; \
+            fi" \
+            "ecs_cluster"
+          
+          # 5. ECR Repository Cleanup (parallel)
+          run_in_background \
+            "aws ecr delete-repository --repository-name \"${{ env.APP_REPO_NAME }}\" --force 2>/dev/null || echo \"ECR repository not found\"" \
+            "ecr_cleanup"
+          
+          # 6. CloudWatch Logs Cleanup (parallel)
+          run_in_background \
+            "aws logs delete-log-group --log-group-name \"/ecs/\$APP_NAME\" 2>/dev/null || echo \"Log group not found\"" \
+            "cw_logs"
+          
+          # Find VPC by tags
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --filters "Name=tag:AppName,Values=$APP_NAME" \
+            --query "Vpcs[0].VpcId" \
+            --output text)
+          
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            echo "Found VPC $VPC_ID, cleaning up networking resources..."
+            
+            # 7. NAT Gateways and EIPs (parallel)
+            run_in_background \
+              "NAT_GW_IDS=\$(aws ec2 describe-nat-gateways \
+                --filter \"Name=vpc-id,Values=\$VPC_ID\" \
+                --query \"NatGateways[].NatGatewayId\" \
+                --output text) && \
+              for NAT_GW_ID in \$NAT_GW_IDS; do \
+                echo \"Deleting NAT Gateway \$NAT_GW_ID\"; \
+                aws ec2 delete-nat-gateway --nat-gateway-id \$NAT_GW_ID || echo \"NAT GW deletion failed\"; \
+                ALLOC_ID=\$(aws ec2 describe-nat-gateways --nat-gateway-ids \$NAT_GW_ID --query \"NatGateways[0].NatGatewayAddresses[0].AllocationId\" --output text); \
+                if [ -n \"\$ALLOC_ID\" ]; then \
+                  echo \"Releasing EIP \$ALLOC_ID\"; \
+                  aws ec2 release-address --allocation-id \$ALLOC_ID || echo \"EIP release failed\"; \
+                fi; \
+              done" \
+              "nat_cleanup"
+            
+            # 8. Internet Gateways (parallel)
+            run_in_background \
+              "IGW_IDS=\$(aws ec2 describe-internet-gateways \
+                --filters \"Name=attachment.vpc-id,Values=\$VPC_ID\" \
+                --query \"InternetGateways[].InternetGatewayId\" \
+                --output text) && \
+              for IGW_ID in \$IGW_IDS; do \
+                echo \"Detaching and deleting IGW \$IGW_ID\"; \
+                aws ec2 detach-internet-gateway --internet-gateway-id \$IGW_ID --vpc-id \$VPC_ID || echo \"Detach failed\"; \
+                aws ec2 delete-internet-gateway --internet-gateway-id \$IGW_ID || echo \"Delete failed\"; \
+              done" \
+              "igw_cleanup"
+            
+            # 9. Subnets (parallel)
+            run_in_background \
+              "SUBNET_IDS=\$(aws ec2 describe-subnets \
+                --filters \"Name=vpc-id,Values=\$VPC_ID\" \
+                --query \"Subnets[].SubnetId\" \
+                --output text) && \
+              for SUBNET_ID in \$SUBNET_IDS; do \
+                echo \"Deleting Subnet \$SUBNET_ID\"; \
+                aws ec2 delete-subnet --subnet-id \$SUBNET_ID || echo \"Subnet deletion failed\"; \
+              done" \
+              "subnet_cleanup"
+            
+            # 10. Security Groups (parallel)
+            run_in_background \
+              "SG_IDS=\$(aws ec2 describe-security-groups \
+                --filters \"Name=vpc-id,Values=\$VPC_ID\" \"Name=tag:AppName,Values=\$APP_NAME\" \
+                --query \"SecurityGroups[].GroupId\" \
+                --output text) && \
+              for SG_ID in \$SG_IDS; do \
+                echo \"Deleting Security Group \$SG_ID\"; \
+                aws ec2 delete-security-group --group-id \$SG_ID || echo \"SG deletion failed\"; \
+              done" \
+              "sg_cleanup"
+            
+            # 11. ENIs (parallel) - Must be cleaned after dependent resources
+            run_in_background \
+              "ENI_IDS=\$(aws ec2 describe-network-interfaces \
+                --filters \"Name=vpc-id,Values=\$VPC_ID\" \
+                --query \"NetworkInterfaces[].NetworkInterfaceId\" \
+                --output text) && \
+              for ENI_ID in \$ENI_IDS; do \
+                echo \"Deleting ENI \$ENI_ID\"; \
+                aws ec2 delete-network-interface --network-interface-id \$ENI_ID || echo \"ENI deletion failed\"; \
+              done" \
+              "eni_cleanup"
+          fi
+          
+          # Wait for all background processes to complete
+          echo "Waiting for parallel cleanup tasks to complete..."
+          for PID in "${PIDS[@]}"; do
+              wait $PID || echo "Background task $PID failed"
+          done
+          
+          # Final VPC deletion (after all dependencies are gone)
+          if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+            echo "Attempting final VPC deletion..."
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" || echo "VPC deletion failed (may have remaining dependencies)"
+          fi
+          
+          # Show cleanup logs for debugging
+          echo "Cleanup logs:"
+          for log in cleanup_logs/*; do
+              echo -e "\n=== $log ==="
+              cat "$log"
+          done
+          
+          echo "Parallel cleanup complete. Waiting for AWS resource propagation..."
+          sleep 60
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      # Step 8: Wait for cleanup completion
+      - name: Wait for resource cleanup
+        run: sleep 60
+
+      # Step 9: Deploy AWS Infrastructure
       - name: Deploy AWS Infrastructure
         run: |
           cd iac
@@ -86,37 +268,34 @@ jobs:
           PRIVATE_SUBNET_CIDR_A: ${{ env.PRIVATE_SUBNET_CIDR_A }}
           PRIVATE_SUBNET_CIDR_B: ${{ env.PRIVATE_SUBNET_CIDR_B }}
 
-      # Step 8: Verify Network Connectivity
+      # Step 10: Verify Network Connectivity
       - name: Verify ECR Access
         run: |
-          # Verify NAT Gateway is operational
-          aws ec2 describe-nat-gateways --filter Name=subnet-id,Values=$(cd iac && terraform output -json public_subnets | jq -r '.[0]') --query "NatGateways[0].State" --region $AWS_REGION
-          
-          # Test connectivity to ECR endpoint
+          aws ec2 describe-nat-gateways --region $AWS_REGION
           aws ecr describe-repositories --repository-names $APP_REPO_NAME --region $AWS_REGION
 
-      # Step 9: Wait for infrastructure
+      # Step 11: Wait for infrastructure stabilization
       - name: Wait for infrastructure stabilization
-        run: sleep 180  # Increased wait time for NAT to be fully operational
+        run: sleep 60
 
-      # Step 10: Login to ECR
+      # Step 12: Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Step 11: Build Docker image
+      # Step 13: Build Docker image
       - name: Build Docker image
         run: |
           docker buildx build --platform linux/amd64 \
             -t ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }} \
             ./app
 
-      # Step 12: Push Docker image
+      # Step 14: Push Docker image
       - name: Push Docker image
         run: |
           docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.APP_REPO_NAME }}:${{ env.APP_IMAGE_TAG }}
 
-      # Step 13: Force ECS deployment with extended timeout
+      # Step 15: Force ECS deployment
       - name: Force ECS deployment
         run: |
           aws ecs update-service \
@@ -124,21 +303,77 @@ jobs:
             --service ${{ env.APP_CLUSTER_NAME }}-service \
             --force-new-deployment \
             --region ${{ env.AWS_REGION }}
-          # Wait for service to stabilize
           aws ecs wait services-stable \
             --cluster ${{ env.APP_CLUSTER_NAME }} \
             --services ${{ env.APP_CLUSTER_NAME }}-service \
             --region ${{ env.AWS_REGION }}
+          sleep 120
 
-      # Step 14: Get ALB DNS
+      # Step 16: Get ALB DNS
       - name: Get ALB DNS
         id: alb-dns
         run: |
-          sleep 30  # Additional wait time for ALB to be fully ready
-          ALB_DNS=$(cd iac && terraform output -raw albDnsName)
-          echo "ALB_DNS=$ALB_DNS" >> $GITHUB_ENV
+          echo "Attempting to get ALB DNS..."
+          DNS_NAME=""
+          
+          # Method 1: Try terraform output
+          if [ -d "iac" ]; then
+            cd iac
+            DNS_NAME=$(terraform output -raw albDnsName 2>/dev/null || echo "")
+            cd ..
+          fi
+          
+          # Method 2: Try AWS CLI if terraform failed
+          if [ -z "$DNS_NAME" ]; then
+            echo "Falling back to AWS CLI..."
+            DNS_NAME=$(aws elbv2 describe-load-balancers \
+              --region ${{ env.AWS_REGION }} \
+              --names tv-devops-alb \
+              --query 'LoadBalancers[0].DNSName' \
+              --output text 2>/dev/null || echo "")
+          fi
+          
+          # Method 3: Try generic describe if named lookup failed
+          if [ -z "$DNS_NAME" ]; then
+            echo "Falling back to generic ALB lookup..."
+            DNS_NAME=$(aws elbv2 describe-load-balancers \
+              --region ${{ env.AWS_REGION }} \
+              --query 'LoadBalancers[?contains(LoadBalancerName,`tv-devops`)].DNSName' \
+              --output text 2>/dev/null || echo "")
+          fi
+          
+          if [ -z "$DNS_NAME" ]; then
+            echo "ERROR: Could not retrieve ALB DNS name"
+            exit 1
+          fi
+          
+          echo "ALB DNS Name: $DNS_NAME"
+          echo "ALB_DNS=$DNS_NAME" >> $GITHUB_ENV
 
-      # Step 15: Test endpoint
+      # Step 17: Test endpoint with enhanced retry logic
       - name: Test ALB endpoint
         run: |
-          curl --retry 10 --retry-delay 15 --retry-connrefused http://${{ env.ALB_DNS }}/health
+          echo "Starting ALB health check..."
+          MAX_RETRIES=15
+          RETRY_DELAY=20
+          HEALTH_ENDPOINT="http://${ALB_DNS}/health"
+          
+          for ((i=1; i<=$MAX_RETRIES; i++)); do
+            echo "Attempt $i/$MAX_RETRIES: Testing $HEALTH_ENDPOINT"
+            
+            if curl -sSf --connect-timeout 10 --max-time 15 "$HEALTH_ENDPOINT"; then
+              echo "Health check passed successfully"
+              exit 0
+            else
+              CURL_EXIT_CODE=$?
+              echo "Health check failed (curl exit code: $CURL_EXIT_CODE)"
+              
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Waiting $RETRY_DELAY seconds before next attempt..."
+                sleep $RETRY_DELAY
+              fi
+            fi
+          done
+          
+          echo "ALB health check failed after $MAX_RETRIES attempts"
+          exit 1
