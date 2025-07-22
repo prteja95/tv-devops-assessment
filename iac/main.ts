@@ -52,6 +52,17 @@ class TvDevOpsStack extends TerraformStack {
   constructor(scope: Construct, id: string) {
     super(scope, id);
 
+    // Common tags for all taggable resources
+    const appClusterName = process.env.APP_CLUSTER_NAME!;
+    const commonTags = {
+      "Project": "tv-devops",
+      "Environment": "production",
+      "ManagedBy": "cdktf",
+      "AppName": appClusterName,
+      "Owner": "devops-team",
+      "CostCenter": "it-1234"
+    };
+
     // Load env
     const region = process.env.AWS_REGION!;
     const awsAccountId = process.env.AWS_ACCOUNT_ID!;
@@ -62,8 +73,7 @@ class TvDevOpsStack extends TerraformStack {
     const privCidrB = process.env.PRIVATE_SUBNET_CIDR_B!;
 
     const appRepoName = process.env.APP_REPO_NAME!;
-    const appClusterName = process.env.APP_CLUSTER_NAME!;
-    const imageTag = process.env.APP_IMAGE_TAG!; // must declare specific version in env
+    const imageTag = process.env.APP_IMAGE_TAG!;
 
     const containerPort = Number(process.env.CONTAINER_PORT || "3000");
     const desiredTasks = Number(process.env.DESIRED_TASKS || "1");
@@ -80,76 +90,117 @@ class TvDevOpsStack extends TerraformStack {
 
     new AwsProvider(this, "aws", { region });
 
-    // VPC
+    // VPC with tags
     const vpc = new Vpc(this, "customVpc", {
       cidrBlock: vpcCidr,
       enableDnsHostnames: true,
       enableDnsSupport: true,
+      tags: { ...commonTags, Name: "tv-devops-vpc" }
     });
 
-    // Internet Gateway
-    const igw = new InternetGateway(this, "igw", { vpcId: vpc.id });
+    // Internet Gateway with tags
+    const igw = new InternetGateway(this, "igw", { 
+      vpcId: vpc.id,
+      tags: commonTags
+    });
 
-    // Public Subnets
+    // Public Subnets with tags
     const publicSubnetA = new Subnet(this, "publicSubnetA", {
       vpcId: vpc.id,
       cidrBlock: pubCidrA,
       availabilityZone: azA,
       mapPublicIpOnLaunch: true,
+      tags: { ...commonTags, Name: "public-subnet-a" }
     });
     const publicSubnetB = new Subnet(this, "publicSubnetB", {
       vpcId: vpc.id,
       cidrBlock: pubCidrB,
       availabilityZone: azB,
       mapPublicIpOnLaunch: true,
+      tags: { ...commonTags, Name: "public-subnet-b" }
     });
 
-    // Public Route Table
-    const publicRT = new RouteTable(this, "publicRT", { vpcId: vpc.id });
+    // Public Route Table with tags
+    const publicRT = new RouteTable(this, "publicRT", { 
+      vpcId: vpc.id,
+      tags: commonTags
+    });
+    
+    // Route doesn't support tags
     new Route(this, "publicInternetRoute", {
       routeTableId: publicRT.id,
       destinationCidrBlock: "0.0.0.0/0",
-      gatewayId: igw.id,
+      gatewayId: igw.id
     });
-    new RouteTableAssociation(this, "pubAssocA", { subnetId: publicSubnetA.id, routeTableId: publicRT.id });
-    new RouteTableAssociation(this, "pubAssocB", { subnetId: publicSubnetB.id, routeTableId: publicRT.id });
 
-    // NAT Gateway
-    const natEip = new Eip(this, "natEip", { domain: "vpc" });
+    // Route table associations don't support tags
+    new RouteTableAssociation(this, "pubAssocA", { 
+      subnetId: publicSubnetA.id, 
+      routeTableId: publicRT.id 
+    });
+    new RouteTableAssociation(this, "pubAssocB", { 
+      subnetId: publicSubnetB.id, 
+      routeTableId: publicRT.id 
+    });
+
+    // NAT Gateway with tags
+    const natEip = new Eip(this, "natEip", { 
+      domain: "vpc",
+      tags: commonTags
+    });
     const natGw = new NatGateway(this, "natGw", {
       allocationId: natEip.allocationId,
       subnetId: publicSubnetA.id,
+      tags: commonTags
     });
 
-    // Private Subnets
+    // Private Subnets with tags
     const privateSubnetA = new Subnet(this, "privateSubnetA", {
       vpcId: vpc.id,
       cidrBlock: privCidrA,
       availabilityZone: azA,
+      tags: { ...commonTags, Name: "private-subnet-a" }
     });
     const privateSubnetB = new Subnet(this, "privateSubnetB", {
       vpcId: vpc.id,
       cidrBlock: privCidrB,
       availabilityZone: azB,
+      tags: { ...commonTags, Name: "private-subnet-b" }
     });
 
-    // Private RT → NAT
-    const privateRT = new RouteTable(this, "privateRT", { vpcId: vpc.id });
+    // Private Route Table with tags
+    const privateRT = new RouteTable(this, "privateRT", { 
+      vpcId: vpc.id,
+      tags: commonTags
+    });
+    
+    // Route doesn't support tags
     new Route(this, "privateNatRoute", {
       routeTableId: privateRT.id,
       destinationCidrBlock: "0.0.0.0/0",
-      natGatewayId: natGw.id,
+      natGatewayId: natGw.id
     });
-    new RouteTableAssociation(this, "privAssocA", { subnetId: privateSubnetA.id, routeTableId: privateRT.id });
-    new RouteTableAssociation(this, "privAssocB", { subnetId: privateSubnetB.id, routeTableId: privateRT.id });
+
+    // Route table associations don't support tags
+    new RouteTableAssociation(this, "privAssocA", { 
+      subnetId: privateSubnetA.id, 
+      routeTableId: privateRT.id 
+    });
+    new RouteTableAssociation(this, "privAssocB", { 
+      subnetId: privateSubnetB.id, 
+      routeTableId: privateRT.id 
+    });
 
     const publicSubnets = [publicSubnetA.id, publicSubnetB.id];
     const privateSubnets = [privateSubnetA.id, privateSubnetB.id];
 
-    // ECS Cluster
-    const ecsCluster = new EcsCluster(this, "ecsCluster", { name: appClusterName });
+    // ECS Cluster with tags
+    const ecsCluster = new EcsCluster(this, "ecsCluster", { 
+      name: appClusterName,
+      tags: commonTags
+    });
 
-    // ✅ Create ALB SG without cross refs
+    // ALB Security Group with tags
     const albSg = new SecurityGroup(this, "albSg", {
       name: "alb-sg",
       description: "Allow inbound HTTP traffic to ALB",
@@ -162,21 +213,23 @@ class TvDevOpsStack extends TerraformStack {
       })),
       egress: [
         { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
-      ]
+      ],
+      tags: commonTags
     });
 
-    // ✅ Create ECS SG without cross refs
+    // ECS Security Group with tags
     const ecsSg = new SecurityGroup(this, "ecsSg", {
       name: "ecs-tasks-sg",
       description: "Allow only ALB to ECS traffic",
       vpcId: vpc.id,
-      ingress: [], // Will add explicit SG rule below
+      ingress: [],
       egress: [
         { fromPort: 0, toPort: 0, protocol: "-1", cidrBlocks: sgEgressCidrs }
-      ]
+      ],
+      tags: commonTags
     });
 
-    // ✅ Add SG-to-SG rules explicitly (breaks dependency cycle)
+    // Security Group Rules - don't support tags
     new SecurityGroupRule(this, "albToEcsRule", {
       type: "egress",
       fromPort: containerPort,
@@ -195,17 +248,22 @@ class TvDevOpsStack extends TerraformStack {
       sourceSecurityGroupId: albSg.id
     });
 
-    // ECR Repo
-    const ecrRepo = new EcrRepository(this, "appRepo", { name: appRepoName });
+    // ECR Repository with tags
+    const ecrRepo = new EcrRepository(this, "appRepo", { 
+      name: appRepoName,
+      tags: commonTags
+    });
 
-    // ALB
+    // ALB with tags
     const alb = new Lb(this, "alb", {
       name: "tv-devops-alb",
       loadBalancerType: "application",
       subnets: publicSubnets,
       securityGroups: [albSg.id],
+      tags: commonTags
     });
 
+    // Target Group with tags
     const targetGroup = new LbTargetGroup(this, "tg", {
       name: "ecs-tg",
       port: containerPort,
@@ -219,16 +277,19 @@ class TvDevOpsStack extends TerraformStack {
         interval: 30,
         timeout: 5,
       },
+      tags: commonTags
     });
 
+    // Listener with tags
     new LbListener(this, "listener", {
       loadBalancerArn: alb.arn,
       port: albPort,
       protocol: "HTTP",
       defaultAction: [{ type: "forward", targetGroupArn: targetGroup.arn }],
+      tags: commonTags
     });
 
-    // IAM Role for ECS Tasks
+    // IAM Role for ECS Tasks with tags
     const ecsTaskRole = new IamRole(this, "ecsTaskRole", {
       name: `ecsTaskRole-${Date.now()}`,
       assumeRolePolicy: JSON.stringify({
@@ -239,20 +300,23 @@ class TvDevOpsStack extends TerraformStack {
           Action: "sts:AssumeRole",
         }],
       }),
+      tags: commonTags
     });
 
+    // IAM Policy Attachment - doesn't support tags
     new IamRolePolicyAttachment(this, "ecsTaskPolicyAttach", {
       role: ecsTaskRole.name,
-      policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy",
+      policyArn: "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
     });
 
-    // CloudWatch Log Group
+    // CloudWatch Log Group with tags
     const logGroup = new CloudwatchLogGroup(this, "ecsLogGroup", {
       name: `/ecs/${appClusterName}`,
       retentionInDays: logRetention,
+      tags: commonTags
     });
 
-    // ECS Task Definition
+    // ECS Task Definition with tags
     const ecsTaskDef = new EcsTaskDefinition(this, "ecsTaskDef", {
       family: `${appClusterName}-task`,
       requiresCompatibilities: ["FARGATE"],
@@ -278,9 +342,10 @@ class TvDevOpsStack extends TerraformStack {
           }
         },
       ]),
+      tags: commonTags
     });
 
-    // ECS Service
+    // ECS Service with tags
     new EcsService(this, "ecsService", {
       name: `${appClusterName}-service`,
       cluster: ecsCluster.id,
@@ -300,6 +365,7 @@ class TvDevOpsStack extends TerraformStack {
         },
       ],
       dependsOn: [alb, targetGroup, ecsTaskDef],
+      tags: commonTags
     });
 
     // Outputs
