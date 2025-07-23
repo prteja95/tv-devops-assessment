@@ -7,6 +7,13 @@
     "hashicorp/aws@~> 5.0"
   ],
   "terraformModules": [],
-  "context": {}
+  "context": {},
+  "terraformBackend": {
+    "s3": {
+      "bucket": "tv-devops-terraform-state",
+      "key": "terraform.tfstate",
+      "region": "us-east-1",
+      "encrypt": true
+    }
+  }
 }
-
